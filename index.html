@@ -102,6 +102,17 @@
                     <input type="number" id="max-context-tokens" min="0" max="10000" step="50" value="500">
                 </div>
 
+                <!-- Data Capture -->
+                <div class="setting-group">
+                    <h3>Data Capture</h3>
+                    <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
+                        Writes attention data to disk as tokens generate. Files saved to <code>Capture_Data/</code>.
+                    </p>
+                    <button id="start-capture-button" class="button button-secondary">🎬 Start Capture</button>
+                    <button id="stop-capture-button" class="button button-secondary" style="display: none;">⏹️ Stop Capture</button>
+                    <div id="capture-status" style="font-size: 0.85rem; margin-top: 0.5rem; color: var(--text-secondary);"></div>
+                </div>
+
                 <!-- Actions -->
                 <div class="setting-group">
                     <button id="clear-button" class="button button-secondary">Clear Chat</button>

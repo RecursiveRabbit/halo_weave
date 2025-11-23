@@ -12,6 +12,7 @@ import { KoboldClient } from './kobold_client.js';
 import { ConversationState } from './conversation_state.js';
 import { AttentionTracker } from './attention_tracker.js';
 import { Heatmap } from './heatmap.js';
+import { DataCapture } from './data_capture.js';
 
 class App {
     constructor() {
@@ -20,6 +21,7 @@ class App {
         this.conversation = new ConversationState();
         this.tracker = new AttentionTracker();
         this.heatmap = new Heatmap(document.getElementById('heatmap'));
+        this.dataCapture = new DataCapture();
 
         // UI elements
         this.userInput = document.getElementById('user-input');
@@ -78,15 +80,18 @@ class App {
         this.userInput.disabled = true;
 
         try {
-            // Tokenize user message
+            // Tokenize user message with ChatML format
             this._updateStatus('Tokenizing...', 'info');
-            const tokens = await this.client.tokenize(text);
+            const formattedText = `<|im_start|>user\n${text}<|im_end|>\n`;
+            const tokens = await this.client.tokenize(formattedText);
 
             // Add to conversation
             this.heatmap.startTurn(this.conversation.currentTurnId, 'user');
+            const startIndex = this.conversation.tokens.length;
             this.conversation.addMessage('user', tokens);
-            for (const token of tokens) {
-                this.heatmap.addToken(this.conversation.tokens[this.conversation.tokens.length - 1]);
+            const endIndex = this.conversation.tokens.length;
+            for (let i = startIndex; i < endIndex; i++) {
+                this.heatmap.addToken(this.conversation.tokens[i]);
             }
             this.conversation.nextTurn();
 
@@ -115,6 +120,15 @@ class App {
         // Start new turn for assistant
         this.heatmap.startTurn(this.conversation.currentTurnId, 'Qwen');
 
+        // Add assistant start token
+        const assistantStart = await this.client.tokenize('<|im_start|>assistant\n');
+        const startIndex = this.conversation.tokens.length;
+        this.conversation.addMessage('Qwen', assistantStart);
+        const endIndex = this.conversation.tokens.length;
+        for (let i = startIndex; i < endIndex; i++) {
+            this.heatmap.addToken(this.conversation.tokens[i]);
+        }
+
         // Get input IDs
         const inputIds = this.conversation.getInputIds();
         const indexToPosition = this.conversation.buildIndexToPositionMap();
@@ -131,6 +145,11 @@ class App {
 
         let tokenCount = 0;
 
+        // If capturing, record prompt tokens
+        if (this.dataCapture.isCapturing) {
+            this.dataCapture.recordPromptTokens(this.conversation.getActiveTokens());
+        }
+
         // Stream generation
         await this.client.generateStream(
             inputIds,
@@ -140,6 +159,11 @@ class App {
                 // Add token to conversation
                 this.conversation.addToken(tokenId, text);
                 const newToken = this.conversation.tokens[this.conversation.tokens.length - 1];
+
+                // Capture full attention data if recording
+                if (this.dataCapture.isCapturing && attention) {
+                    this.dataCapture.recordGeneratedToken(newToken, attention, tokenCount);
+                }
 
                 // Update attention if available
                 if (attention) {
@@ -234,12 +258,17 @@ class App {
      */
     async _addSystemMessage() {
         const systemPrompt = document.getElementById('system-prompt').value;
-        const tokens = await this.client.tokenize(systemPrompt);
+
+        // Format with ChatML tokens: <|im_start|>system\n{prompt}<|im_end|>\n
+        const formattedPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n`;
+        const tokens = await this.client.tokenize(formattedPrompt);
 
         this.heatmap.startTurn(this.conversation.currentTurnId, 'system');
+        const startIndex = this.conversation.tokens.length;
         this.conversation.addMessage('system', tokens);
-        for (const token of tokens) {
-            this.heatmap.addToken(this.conversation.tokens[this.conversation.tokens.length - 1]);
+        const endIndex = this.conversation.tokens.length;
+        for (let i = startIndex; i < endIndex; i++) {
+            this.heatmap.addToken(this.conversation.tokens[i]);
         }
         this.conversation.nextTurn();
     }
@@ -328,6 +357,51 @@ class App {
             a.href = url;
             a.download = `halo_weave_${Date.now()}.json`;
             a.click();
+        });
+
+        // Data capture buttons
+        document.getElementById('start-capture-button')?.addEventListener('click', async () => {
+            const status = document.getElementById('capture-status');
+            const startBtn = document.getElementById('start-capture-button');
+            const stopBtn = document.getElementById('stop-capture-button');
+
+            status.textContent = '🎬 Starting capture...';
+            startBtn.disabled = true;
+
+            try {
+                await this.dataCapture.startCapture({
+                    model: this.modelInfo?.model_name || 'unknown',
+                    description: 'Attention pattern analysis experiment',
+                    config: {
+                        max_length: parseInt(document.getElementById('max-length').value),
+                        temperature: parseFloat(document.getElementById('temperature').value),
+                        top_p: parseFloat(document.getElementById('top-p').value)
+                    }
+                });
+
+                startBtn.style.display = 'none';
+                stopBtn.style.display = 'block';
+                startBtn.disabled = false;
+                status.textContent = '🔴 Recording to disk...';
+            } catch (err) {
+                status.textContent = `❌ Failed to start: ${err.message}`;
+                startBtn.disabled = false;
+                console.error('Capture start error:', err);
+            }
+        });
+
+        document.getElementById('stop-capture-button')?.addEventListener('click', () => {
+            const summary = this.dataCapture.stopCapture();
+            const status = document.getElementById('capture-status');
+            const startBtn = document.getElementById('start-capture-button');
+            const stopBtn = document.getElementById('stop-capture-button');
+
+            stopBtn.style.display = 'none';
+            startBtn.style.display = 'block';
+
+            if (summary) {
+                status.textContent = `✅ Saved ${summary.tokens_captured} tokens to ${summary.capture_dir}`;
+            }
         });
     }
 

@@ -10,6 +10,9 @@ export class Heatmap {
         this.container = containerElement;
         this.currentTurnElement = null;
         this.currentSentenceElement = null;
+        this.currentSentenceTokens = []; // Track tokens in current sentence for peak calculation
+        this.lastTurnId = null;
+        this.lastSentenceId = null;
     }
 
     /**
@@ -19,6 +22,8 @@ export class Heatmap {
         this.container.innerHTML = '';
         this.currentTurnElement = null;
         this.currentSentenceElement = null;
+        this.lastTurnId = null;
+        this.lastSentenceId = null;
     }
 
     /**
@@ -56,10 +61,14 @@ export class Heatmap {
             return;
         }
 
+        // Update background color of previous sentence based on its peak
+        this._updateSentenceBackground();
+
         this.currentSentenceElement = document.createElement('div');
         this.currentSentenceElement.className = 'sentence';
         this.currentSentenceElement.dataset.sentenceId = sentenceId;
         this.currentTurnElement.appendChild(this.currentSentenceElement);
+        this.currentSentenceTokens = []; // Reset for new sentence
     }
 
     /**
@@ -67,26 +76,53 @@ export class Heatmap {
      * @param {Object} token - Token object from ConversationState
      */
     addToken(token) {
-        if (!this.currentSentenceElement) {
-            console.warn('addToken called without active sentence');
-            return;
+        // Check if we need to create a new sentence element
+        // Trust the sentence_id from ConversationState (single source of truth)
+        if (!this.currentSentenceElement ||
+            token.sentence_id !== this.lastSentenceId ||
+            token.turn_id !== this.lastTurnId) {
+
+            // Update background of previous sentence before starting new one
+            if (this.currentSentenceElement && this.currentSentenceTokens.length > 0) {
+                this._updateSentenceBackground();
+            }
+
+            this.startSentence(token.sentence_id);
+            this.lastSentenceId = token.sentence_id;
+            this.lastTurnId = token.turn_id;
         }
+
+        // Track token for sentence peak calculation
+        this.currentSentenceTokens.push(token);
 
         const span = document.createElement('span');
         span.className = 'token';
         span.dataset.position = token.position;
         span.textContent = token.text;
-        span.style.backgroundColor = this._getColorForScore(token.attention_score);
+
+        // Text color based on individual token score
+        span.style.color = this._getTextColorForScore(token.attention_score);
 
         // Tooltip with metadata
-        span.title = `Position: ${token.position}\nScore: ${token.attention_score.toFixed(4)}\nRaw: ${token.raw_attention.toFixed(6)}`;
+        const historyStr = token.attention_history ? token.attention_history.map(v => v.toFixed(3)).join(', ') : 'none';
+        span.title = `Position: ${token.position}\nScore: ${token.attention_score.toFixed(2)}\nPeak: ${token.peak_attention.toFixed(2)}\nRaw: ${token.raw_attention.toFixed(4)}\nHistory: [${historyStr}]`;
 
         this.currentSentenceElement.appendChild(span);
+    }
 
-        // Check for sentence boundary
-        if (token.text.trim().match(/[.!?]$/)) {
-            this.startSentence(token.sentence_id + 1);
+    /**
+     * Update sentence background based on peak brightness of current sentence
+     */
+    _updateSentenceBackground() {
+        if (!this.currentSentenceElement || this.currentSentenceTokens.length === 0) {
+            return;
         }
+
+        // Find peak attention in sentence
+        const peakScore = Math.max(...this.currentSentenceTokens.map(t => t.attention_score));
+
+        // Set background color based on peak
+        this.currentSentenceElement.style.backgroundColor = this._getColorForScore(peakScore);
     }
 
     /**
@@ -94,13 +130,41 @@ export class Heatmap {
      * @param {ConversationState} conversationState
      */
     updateAll(conversationState) {
+        // Group tokens by sentence for peak calculation
+        const sentenceMap = new Map();
         for (const token of conversationState.tokens) {
             if (token.deleted) continue;
+            const key = `${token.turn_id}-${token.sentence_id}-${token.message_role}`;
+            if (!sentenceMap.has(key)) {
+                sentenceMap.set(key, []);
+            }
+            sentenceMap.get(key).push(token);
+        }
 
-            const span = this.container.querySelector(`span[data-position="${token.position}"]`);
-            if (span) {
-                span.style.backgroundColor = this._getColorForScore(token.attention_score);
-                span.title = `Position: ${token.position}\nScore: ${token.attention_score.toFixed(4)}\nRaw: ${token.raw_attention.toFixed(6)}`;
+        // Update each sentence background and token colors
+        for (const [key, tokens] of sentenceMap) {
+            const peakScore = Math.max(...tokens.map(t => t.attention_score));
+            const [turnId, sentenceId, role] = key.split('-');
+
+            // Find sentence element
+            const turnEl = this.container.querySelector(
+                `.attention-turn[data-turn-id="${turnId}"][data-role="${role}"]`
+            );
+            if (turnEl) {
+                const sentenceEl = turnEl.querySelector(`.sentence[data-sentence-id="${sentenceId}"]`);
+                if (sentenceEl) {
+                    sentenceEl.style.backgroundColor = this._getColorForScore(peakScore);
+                }
+            }
+
+            // Update individual token text colors
+            for (const token of tokens) {
+                const span = this.container.querySelector(`span[data-position="${token.position}"]`);
+                if (span) {
+                    span.style.color = this._getTextColorForScore(token.attention_score);
+                    const historyStr = token.attention_history ? token.attention_history.map(v => v.toFixed(3)).join(', ') : 'none';
+                    span.title = `Position: ${token.position}\nScore: ${token.attention_score.toFixed(2)}\nPeak: ${token.peak_attention.toFixed(2)}\nRaw: ${token.raw_attention.toFixed(4)}\nHistory: [${historyStr}]`;
+                }
             }
         }
     }
@@ -176,30 +240,79 @@ export class Heatmap {
     }
 
     /**
-     * Get background color for attention score
-     * @param {number} score - Attention score (0.0-1.0)
+     * Get background color for attention score (RAW LOGITS)
+     * @param {number} score - Raw attention score (can be negative!)
      * @returns {string} CSS color
+     *
+     * Color scale for raw logits (typical range: -100 to +100):
+     * - Very negative (<-10): Very dark blue (almost black) - "dead" tokens
+     * - Negative (-10 to 0): Dark blue to gray - "fading" tokens
+     * - Neutral (0): Gray - baseline
+     * - Positive (0 to +10): Gray to cyan - "lit" tokens
+     * - Very positive (>10): Cyan to white - "bright" tokens
+     *
+     * This is tunable after observing real data!
      */
     _getColorForScore(score) {
-        // Clamp to [0, 1]
-        score = Math.max(0.0, Math.min(1.0, score));
+        // Map raw logits to color scale
+        // We'll use a range of [-20, +20] mapped to [0, 1] for color interpolation
+        // This is adjustable based on observed data
+        const minLogit = -20;
+        const maxLogit = 20;
 
-        // Interpolate from dark (low attention) to bright (high attention)
-        // Dark blue -> cyan -> white
-        if (score < 0.5) {
-            // 0.0 -> 0.5: dark blue (#001f3f) to cyan (#7fdbff)
-            const t = score * 2;
-            const r = Math.round(0 + t * 127);
-            const g = Math.round(31 + t * 188);
-            const b = Math.round(63 + t * 192);
+        // Normalize to [0, 1] for color mapping
+        let normalized = (score - minLogit) / (maxLogit - minLogit);
+        normalized = Math.max(0.0, Math.min(1.0, normalized)); // Clamp for color only
+
+        // Interpolate from dark (negative attention) to bright (positive attention)
+        // Very dark blue -> dark blue -> cyan -> white
+        if (normalized < 0.5) {
+            // 0.0 -> 0.5: very dark blue (#000a1f) to dark blue (#001f3f) to gray-blue (#4080a0)
+            const t = normalized * 2;
+            const r = Math.round(0 + t * 64);
+            const g = Math.round(10 + t * 118);
+            const b = Math.round(31 + t * 129);
             return `rgb(${r}, ${g}, ${b})`;
         } else {
-            // 0.5 -> 1.0: cyan (#7fdbff) to white (#ffffff)
-            const t = (score - 0.5) * 2;
-            const r = Math.round(127 + t * 128);
-            const g = Math.round(219 + t * 36);
-            const b = Math.round(255 + t * 0);
+            // 0.5 -> 1.0: gray-blue (#4080a0) to cyan (#7fdbff) to white (#ffffff)
+            const t = (normalized - 0.5) * 2;
+            const r = Math.round(64 + t * 191);
+            const g = Math.round(128 + t * 127);
+            const b = Math.round(160 + t * 95);
             return `rgb(${r}, ${g}, ${b})`;
+        }
+    }
+
+    /**
+     * Get text color for individual token brightness
+     * @param {number} score - Raw attention score (can be very large or negative)
+     * @returns {string} CSS color
+     *
+     * Text brightness scale:
+     * - Very negative (<-50): Dark gray (#404040) - "forgotten" tokens
+     * - Negative (-50 to 0): Gray to light gray - "fading" tokens
+     * - Neutral (0): Medium light gray (#b0b0b0) - baseline
+     * - Positive (0 to +50): Light gray to white - "lit" tokens
+     * - Very positive (>50): Bright white (#ffffff) - "bright" tokens
+     */
+    _getTextColorForScore(score) {
+        // Map score to brightness range [-100, +100] → [0, 1]
+        const minScore = -100;
+        const maxScore = 100;
+        let normalized = (score - minScore) / (maxScore - minScore);
+        normalized = Math.max(0.0, Math.min(1.0, normalized)); // Clamp for color only
+
+        // Interpolate from dark gray to white
+        if (normalized < 0.5) {
+            // 0.0 -> 0.5: dark gray (#404040) to medium gray (#808080)
+            const t = normalized * 2;
+            const gray = Math.round(64 + t * 64);
+            return `rgb(${gray}, ${gray}, ${gray})`;
+        } else {
+            // 0.5 -> 1.0: medium gray (#808080) to white (#ffffff)
+            const t = (normalized - 0.5) * 2;
+            const gray = Math.round(128 + t * 127);
+            return `rgb(${gray}, ${gray}, ${gray})`;
         }
     }
 
@@ -226,8 +339,9 @@ export class Heatmap {
 
             for (const token of sentence.tokens) {
                 if (!token.deleted) {
-                    const score = (token.attention_score * 100).toFixed(0);
-                    output += `${token.text}[${score}%] `;
+                    // Show raw logit score (not percentage)
+                    const score = token.attention_score.toFixed(2);
+                    output += `${token.text}[${score}] `;
                 }
             }
 

@@ -18,3 +18,7 @@ Thumbs.db
 
 # Node modules (if ever needed)
 node_modules/
+
+# Test captures (large binary data)
+tests/captures/Capture_Data/
+tests/captures/*.json

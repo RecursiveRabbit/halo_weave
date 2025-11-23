@@ -19,7 +19,7 @@ export class KoboldClient {
      * @returns {Promise<Object>} Model info
      */
     async getModelInfo() {
-        const response = await fetch(`${this.baseUrl}/api/v1/model/info`);
+        const response = await fetch(`${this.baseUrl}/api/v1/model`);
         if (!response.ok) {
             throw new Error(`Failed to get model info: ${response.statusText}`);
         }
@@ -79,6 +79,7 @@ export class KoboldClient {
 
     /**
      * Stream generation with attention extraction
+     * Uses SSE (Server-Sent Events) instead of WebSocket
      * @param {Array<number>} inputIds - Input token IDs
      * @param {Object} config - Generation config
      * @param {Function} onToken - Callback for each token: (tokenId, text, attention) => void
@@ -86,67 +87,92 @@ export class KoboldClient {
      * @param {Function} onError - Callback for errors
      */
     async generateStream(inputIds, config, onToken, onDone, onError) {
-        // Close existing connection if any
-        if (this.ws) {
-            this.ws.close();
-        }
+        try {
+            const requestId = this._generateRequestId();
 
-        // Open WebSocket connection
-        const wsUrl = this.baseUrl.replace('http://', 'ws://').replace('https://', 'wss://');
-        this.ws = new WebSocket(`${wsUrl}/api/v1/generate/stream`);
+            const response = await fetch(`${this.baseUrl}/api/extra/generate/stream`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'text/event-stream'
+                },
+                body: JSON.stringify({
+                    input_ids: inputIds,
+                    max_length: config.maxNewTokens || 50,
+                    temperature: config.temperature || 0.7,
+                    top_p: config.topP || 0.9,
+                    top_k: config.topK || 40,
+                    rep_pen: config.repetitionPenalty || 1.0,
+                    output_attentions: config.returnAttention !== false,
+                    request_id: requestId,
+                    sampler_seed: config.seed || -1
+                })
+            });
 
-        this.ws.onopen = () => {
-            // Send generation request
-            const request = {
-                type: 'generate',
-                request_id: this._generateRequestId(),
-                input_ids: inputIds,
-                max_new_tokens: config.maxNewTokens || 50,
-                temperature: config.temperature || 0.7,
-                top_p: config.topP || 0.9,
-                top_k: config.topK || 40,
-                repetition_penalty: config.repetitionPenalty || 1.0,
-                stop_tokens: config.stopTokens || [],
-                banned_tokens: config.bannedTokens || [],
-                return_attention: config.returnAttention !== false,
-                attention_format: 'per_layer'
-            };
+            if (!response.ok) {
+                throw new Error(`Generation failed: ${response.statusText}`);
+            }
 
-            this.ws.send(JSON.stringify(request));
-        };
+            // Parse SSE stream
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
 
-        this.ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
+            while (true) {
+                const { done, value } = await reader.read();
 
-            if (data.type === 'token') {
-                // Decode attention if present
-                let attention = null;
-                if (data.attention && config.returnAttention !== false) {
-                    attention = this._decodeAttention(data.attention);
+                if (done) break;
+
+                // Decode chunk and add to buffer
+                buffer += decoder.decode(value, { stream: true });
+
+                // Process complete SSE messages
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const jsonData = line.slice(6); // Remove 'data: ' prefix
+
+                        try {
+                            const data = JSON.parse(jsonData);
+
+                            if (data.type === 'token') {
+                                // Decode attention if present
+                                let attention = null;
+                                if (data.attention && config.returnAttention !== false) {
+                                    attention = this._decodeAttention(data.attention);
+                                }
+
+                                // Call token callback
+                                onToken(data.token.token_id, data.token.text, attention);
+
+                            } else if (data.type === 'done') {
+                                onDone(data);
+                                return;
+
+                            } else if (data.finish_reason) {
+                                // Old format: {token: "text", finish_reason: "length"}
+                                if (data.token) {
+                                    // This is the last token
+                                    onToken(null, data.token, null);
+                                }
+                                onDone({ finish_reason: data.finish_reason, request_id: requestId });
+                                return;
+                            }
+                        } catch (parseError) {
+                            console.warn('Failed to parse SSE data:', jsonData, parseError);
+                        }
+                    }
                 }
-
-                // Call token callback
-                onToken(data.token.token_id, data.token.text, attention);
-
-            } else if (data.type === 'done') {
-                this.ws.close();
-                onDone(data);
-
-            } else if (data.type === 'error') {
-                this.ws.close();
-                onError(new Error(data.error));
             }
-        };
 
-        this.ws.onerror = (event) => {
-            onError(new Error('WebSocket error'));
-        };
+            // If we reach here without a done event, still call onDone
+            onDone({ finish_reason: 'complete', request_id: requestId });
 
-        this.ws.onclose = (event) => {
-            if (!event.wasClean) {
-                onError(new Error('WebSocket connection closed unexpectedly'));
-            }
-        };
+        } catch (error) {
+            onError(error);
+        }
     }
 
     /**
@@ -188,13 +214,10 @@ export class KoboldClient {
     }
 
     /**
-     * Close WebSocket connection
+     * Close any active connections (no-op for SSE, kept for API compatibility)
      */
     disconnect() {
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
-        }
+        // SSE connections close automatically, nothing to do
     }
 
     /**
@@ -203,7 +226,7 @@ export class KoboldClient {
      */
     async ping() {
         try {
-            const response = await fetch(`${this.baseUrl}/api/v1/model/info`, {
+            const response = await fetch(`${this.baseUrl}/api/v1/model`, {
                 method: 'GET',
                 signal: AbortSignal.timeout(5000)
             });

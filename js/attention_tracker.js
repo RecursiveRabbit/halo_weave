@@ -1,10 +1,12 @@
 /**
  * AttentionTracker - Attention Aggregation and Decay
  *
- * Processes raw attention tensors from KoboldCPP:
+ * Processes RAW PRE-SOFTMAX LOGITS from KoboldCPP:
+ * - Input: Raw logits (typically -100 to +100, can be negative!)
  * - Aggregates across layers/heads (mean, max, weighted, last_layer)
  * - Applies distance weighting (filters local attention noise)
- * - Accumulates scores over time with decay
+ * - Accumulates scores over time with optional decay
+ * - NO CLAMPING: Negative scores represent "dark" tokens naturally
  * - Updates conversation state with new scores
  */
 
@@ -68,8 +70,10 @@ export class AttentionTracker {
             const decay = this._calculateDecay(oldScore, this.step);
             let newScore = oldScore + weightedAttention - decay;
 
-            // Clamp to [0, 1]
-            newScore = Math.max(0.0, Math.min(1.0, newScore));
+            // NO CLAMPING: Raw logits can be negative!
+            // Negative scores = "dark" tokens (not attended to)
+            // Positive scores = "bright" tokens (actively attended)
+            // This is MORE informative than normalized [0, 1] range
 
             // Update token
             conversationState.updateAttentionScore(position, newScore, aggregated[i]);

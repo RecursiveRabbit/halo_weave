@@ -1,0 +1,103 @@
+Total sentences: 82
+Sentences with peak = 0: 59
+Sentences with peak > 0: 23
+Total generation steps: 326
+
+================================================================================
+SENTENCES WITH PEAK > 0 (in original order)
+================================================================================
+
+[Turn 0, Sentence 0, Peak=326, Tokens=20]
+system
+You are Qwen, an AI participating in a research project on attention-based context management
+
+[Turn 0, Sentence 1, Peak=213, Tokens=9]
+. You are helpful, harmless, and honest
+
+[Turn 0, Sentence 2, Peak=13, Tokens=3]
+.
+
+
+[Turn 1, Sentence 0, Peak=140, Tokens=11]
+user
+What are the implications of the following article
+
+[Turn 1, Sentence 1, Peak=177, Tokens=19]
+? 
+
+The Patent Office Is About To Make Bad Patents Untouchable
+The U.S
+
+[Turn 1, Sentence 2, Peak=217, Tokens=33]
+. Patent and Trademark Office (USPTO) has proposed new rules that would effectively end the public’s ability to challenge improperly granted patents at the Patent Office itself
+
+[Turn 1, Sentence 3, Peak=305, Tokens=12]
+. We need EFF
+
+By Joe Mullin
+
+6 min
+
+[Turn 1, Sentence 4, Peak=174, Tokens=8]
+. readView original
+The U.S
+
+[Turn 1, Sentence 5, Peak=289, Tokens=35]
+. Patent and Trademark Office (USPTO) has proposed new rules that would effectively end the public’s ability to challenge improperly granted patents at their source—the Patent Office itself
+
+[Turn 1, Sentence 6, Peak=218, Tokens=32]
+. If these rules take effect, they will hand patent trolls exactly what they’ve been chasing for years: a way to keep bad patents alive and out of reach
+
+[Turn 1, Sentence 7, Peak=215, Tokens=19]
+. People targeted with troll lawsuits will be left with almost no realistic or affordable way to defend themselves
+
+[Turn 1, Sentence 8, Peak=128, Tokens=14]
+.
+
+We need EFF supporters to file public comments opposing these rules right away
+
+[Turn 1, Sentence 9, Peak=183, Tokens=10]
+. The deadline for public comments is December 2
+
+[Turn 1, Sentence 10, Peak=187, Tokens=21]
+. The USPTO is moving quickly, and staying silent will only help those who profit from abusive patents
+
+[Turn 1, Sentence 11, Peak=142, Tokens=43]
+. 
+
+TAKE ACTION
+
+Tell USPTO: The public has a right to challenge bad patents
+
+We’re asking supporters who care about a fair patent system to file comments using the federal government’s public comment system
+
+[Turn 1, Sentence 12, Peak=103, Tokens=16]
+. Your comments don’t need to be long, or use legal or technical vocabulary
+
+[Turn 1, Sentence 13, Peak=79, Tokens=23]
+. The important thing is that everyday users and creators of technology have  the chance to speak up, and be counted
+
+[Turn 1, Sentence 14, Peak=68, Tokens=14]
+. 
+
+Below is a short, simple comment you can copy and paste
+
+[Turn 1, Sentence 15, Peak=72, Tokens=18]
+. Your comment will carry more weight if you add a personal sentence or two of your own
+
+[Turn 1, Sentence 16, Peak=49, Tokens=20]
+. Please note that comments should be submitted under your real name and will become part of the public record
+
+[Turn 1, Sentence 17, Peak=45, Tokens=27]
+. 
+
+Sample comment: 
+
+I oppose the USPTO’s proposed rule changes for inter partes review (IPR), Docket No
+
+[Turn 1, Sentence 18, Peak=20, Tokens=14]
+. PTO-P-2025-0025
+
+[Turn 1, Sentence 19, Peak=7, Tokens=10]
+. The IPR process must remain open and fair
+
