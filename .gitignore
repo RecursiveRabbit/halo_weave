@@ -16,9 +16,18 @@ Thumbs.db
 *.tmp
 *.bak
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
 # Node modules (if ever needed)
 node_modules/
 
 # Test captures (large binary data)
 tests/captures/Capture_Data/
 tests/captures/*.json
+
+# Test results (generated reports - can be regenerated)
+tests/strategy_framework/test_results/

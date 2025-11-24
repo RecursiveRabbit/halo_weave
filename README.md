@@ -69,7 +69,8 @@ Tested on Chrome 120+, Firefox 120+
 
 ```bash
 cd /path/to/koboldcpp
-./koboldcpp_cublas.so --model /path/to/model.gguf --port 5001
+python3 koboldcpp.py --model /home/evans/Coding_Projects/Halo_Weave/models/Qwen2.5-VL-7B-Instruct-Q8_0.gguf --port 5001 --usecublas 0 --gpulayers 999 --contextsize 512
+
 ```
 
 ### 2. Serve Frontend

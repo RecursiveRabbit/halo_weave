@@ -894,3 +894,134 @@ Likely needs changes in KoboldCPP's `llama_decode()` or `eval()` paths to extrac
 - Implement automatic pruning when context exceeds limit
 - Test with multiple models and conversation types
 - Add user controls for pruning aggressiveness
+
+---
+
+## Session Summary (2025-11-23)
+
+### ✅ COMPLETED
+
+1. **Strategy Testing Framework**
+   - Created modular framework for comparing brightness scoring strategies
+   - Built abstract base class (`base_strategy.py`) defining common interface
+   - All strategies inherit from base, ensuring fair comparison
+   - Automatic export to markdown (human-readable) + JSON (machine-readable)
+
+2. **Two Complete Strategies Implemented**
+   - **Voting Strategy** (`voting_strategy.py`) - Rolling mean voting system
+     - Discrete vote counts (+1 if attention > local mean)
+     - Min-distance filter to eliminate local wave bias
+     - Measures frequency: "How often was this referenced?"
+   - **Cumulative Strategy** (`cumulative_strategy.py`) - Accumulate with decay
+     - Continuous scores (raw logits, can be negative)
+     - Distance weighting + decay per step
+     - Measures magnitude: "How much attention was paid?"
+
+3. **Comparison Runner** (`run_comparison.py`)
+   - Executes all strategies on same capture data
+   - Generates individual reports per strategy
+   - Produces side-by-side comparison with agreement/disagreement analysis
+   - Shows which sentences all strategies agree on vs unique rankings
+
+4. **Documentation**
+   - `BRIGHTNESS_STRATEGIES.md` - High-level comparison of both systems
+   - `tests/strategy_framework/README.md` - Usage documentation
+   - `tests/strategy_framework/IMPLEMENTATION_SUMMARY.md` - Implementation notes and findings
+
+### 📊 Test Results
+
+**Capture 1 (capture_1763842540750): 1,703 tokens, 326 steps**
+- **8/10 top sentences agreed** between both strategies
+- Strong convergence on article core content, system prompt, key entities
+- Voting: scores 1-326, Cumulative: scores -0.83 to 241.37
+- Both strategies robust to different score ranges
+
+**Capture 2 (capture_1763788462071): 198 tokens, 387 steps**
+- **9/9 sentences agreed** (100% convergence)
+- Cumulative scores went heavily negative (decay dominated short context)
+- Rankings still correct despite negative scores
+- Demonstrates robust anchor detection across different scoring mechanics
+
+### 🔑 Key Insights
+
+1. **Both strategies converge on same anchors** despite:
+   - Different scoring mechanics (discrete vs continuous)
+   - Different score ranges (positive only vs negative/positive)
+   - Different parameters (min_distance 50 vs 20)
+
+2. **Current turn immunity problem identified:**
+   - Tokens in current turn accumulate huge attention during generation
+   - Creates unfair bias (prompt tokens never get local wave)
+   - Solution proposed: Skip attention accumulation for `current_turn_id`
+   - Not yet implemented (frontend unchanged, research-only phase)
+
+3. **Decay rate matters for cumulative:**
+   - 0.003 decay × 387 steps = everything goes negative
+   - Need to tune based on conversation length
+   - Or implement adaptive decay
+
+### 📁 Files Created
+
+**Strategy Framework:**
+- `tests/strategy_framework/base_strategy.py` - Abstract base class (300 lines)
+- `tests/strategy_framework/voting_strategy.py` - Rolling mean voting (140 lines)
+- `tests/strategy_framework/cumulative_strategy.py` - Accumulate with decay (150 lines)
+- `tests/strategy_framework/run_comparison.py` - Comparison runner (200 lines)
+- `tests/strategy_framework/README.md` - Usage documentation
+- `tests/strategy_framework/IMPLEMENTATION_SUMMARY.md` - Implementation notes
+
+**Documentation:**
+- `BRIGHTNESS_STRATEGIES.md` - High-level strategy comparison
+
+**Test Results:** (gitignored)
+- `tests/strategy_framework/test_results/capture_*/` - Generated reports
+
+### 🏗️ Architecture Decisions
+
+**Frontend stays unchanged:**
+- Current `js/` files are data capture pipeline only
+- All research happens in Python analysis scripts
+- Once best strategy determined, integrate back into frontend
+
+**Output formats:**
+- **Markdown** - Human-readable sentence rankings for qualitative evaluation
+- **JSON** - Machine-readable data for quantitative analysis and plotting
+
+**Modular design:**
+- Easy to add new strategies (inherit from base class)
+- Fair comparison (same data, same tooling)
+- Sentence-level aggregation (peak score per sentence)
+
+### ⚠️ Current Limitations
+
+1. **Frontend brightness ignored** - Using voting/cumulative from analysis scripts only
+2. **Need better test data** - Short captures with many steps = decay dominated
+3. **No ground truth** - Manual annotation needed for precision/recall metrics
+4. **No regeneration testing** - Haven't validated pruned context maintains output quality
+5. **Single model** - Qwen2.5-VL-7B only
+
+### 🎯 Next Steps
+
+**Immediate:**
+1. Capture longer conversations (1000+ tokens)
+2. Mixed content types (code, explanations, questions)
+3. Multiple turns with varying importance
+4. Run comparison framework on diverse data
+
+**Medium term:**
+1. Implement hybrid strategies (votes weighted by magnitude)
+2. Test parameter sensitivity (decay rates, min-distance, aggregation modes)
+3. Generate visualizations (score distributions, rank correlations)
+4. Manual annotation of important content (ground truth)
+
+**Long term:**
+1. Compute precision/recall metrics with ground truth
+2. Regeneration quality testing (prune context, measure output degradation)
+3. Integrate best strategy into frontend for real-time pruning
+4. Adaptive strategies (change behavior based on conversation context)
+
+---
+
+**Last Updated:** 2025-11-23
+**Status:** ✅ Strategy framework complete and tested
+**Next Test:** Longer, diverse conversation captures for better strategy differentiation
