@@ -13,6 +13,8 @@ import json
 
 from voting_strategy import VotingStrategy
 from cumulative_strategy import CumulativeStrategy
+from symmetric_voting_strategy import SymmetricVotingStrategy
+from magnitude_voting_strategy import MagnitudeVotingStrategy
 from base_strategy import ScoredSentence
 
 
@@ -147,14 +149,21 @@ def generate_comparison_report(strategies_results: Dict[str, tuple], output_file
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 run_comparison.py <capture_dir>")
+        print("Usage: python3 run_comparison.py <capture_dir> [export_file]")
         print("\nRuns all strategies on the same capture and generates comparison report.")
+        print("\nOptional: Provide export_file (halo_weave_*.json) for full token metadata.")
+        print("If not provided, only analyzes prompt tokens from metadata.json.")
         sys.exit(1)
 
     capture_dir = Path(sys.argv[1])
+    export_file = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 
     if not capture_dir.exists():
         print(f"Error: Capture directory does not exist: {capture_dir}")
+        sys.exit(1)
+
+    if export_file and not export_file.exists():
+        print(f"Error: Export file does not exist: {export_file}")
         sys.exit(1)
 
     # Create output directory
@@ -172,7 +181,7 @@ def main():
 
     # Strategy 1: Voting
     print("\n" + "="*80)
-    strategy = VotingStrategy(capture_dir, min_distance=50)
+    strategy = VotingStrategy(capture_dir, export_file=export_file, min_distance=50)
     sentences, metadata = strategy.run()
     strategy.export_markdown(sentences, metadata, output_dir / 'voting_strategy.md')
     strategy.export_json(sentences, metadata, output_dir / 'voting_strategy.json')
@@ -180,11 +189,27 @@ def main():
 
     # Strategy 2: Cumulative
     print("\n" + "="*80)
-    strategy = CumulativeStrategy(capture_dir, decay_rate=0.003, min_distance=20)
+    strategy = CumulativeStrategy(capture_dir, export_file=export_file, decay_rate=0.001, min_distance=20)
     sentences, metadata = strategy.run()
     strategy.export_markdown(sentences, metadata, output_dir / 'cumulative_strategy.md')
     strategy.export_json(sentences, metadata, output_dir / 'cumulative_strategy.json')
     strategies_results['Cumulative'] = (sentences, metadata)
+
+    # Strategy 3: Symmetric Voting (±1)
+    print("\n" + "="*80)
+    strategy = SymmetricVotingStrategy(capture_dir, export_file=export_file)
+    sentences, metadata = strategy.run()
+    strategy.export_markdown(sentences, metadata, output_dir / 'symmetric_voting_strategy.md')
+    strategy.export_json(sentences, metadata, output_dir / 'symmetric_voting_strategy.json')
+    strategies_results['Symmetric Voting'] = (sentences, metadata)
+
+    # Strategy 4: Magnitude-Weighted Voting
+    print("\n" + "="*80)
+    strategy = MagnitudeVotingStrategy(capture_dir, export_file=export_file)
+    sentences, metadata = strategy.run()
+    strategy.export_markdown(sentences, metadata, output_dir / 'magnitude_voting_strategy.md')
+    strategy.export_json(sentences, metadata, output_dir / 'magnitude_voting_strategy.json')
+    strategies_results['Magnitude Voting'] = (sentences, metadata)
 
     # Generate comparison report
     print("\n" + "="*80)
@@ -200,6 +225,10 @@ def main():
     print(f"  - voting_strategy.json (machine-readable)")
     print(f"  - cumulative_strategy.md (human-readable)")
     print(f"  - cumulative_strategy.json (machine-readable)")
+    print(f"  - symmetric_voting_strategy.md (human-readable)")
+    print(f"  - symmetric_voting_strategy.json (machine-readable)")
+    print(f"  - magnitude_voting_strategy.md (human-readable)")
+    print(f"  - magnitude_voting_strategy.json (machine-readable)")
     print(f"  - comparison_report.md (side-by-side analysis)")
 
 

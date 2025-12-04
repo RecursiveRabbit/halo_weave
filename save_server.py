@@ -10,6 +10,9 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+# Output directory for captures
+CAPTURE_BASE_DIR = Path('tests/captures/Capture_Data')
+
 class CaptureHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """Handle CORS preflight"""
@@ -51,7 +54,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
         if not timestamp:
             raise ValueError("Missing timestamp")
 
-        capture_dir = Path('Capture_Data') / f'capture_{timestamp}'
+        capture_dir = CAPTURE_BASE_DIR / f'capture_{timestamp}'
         capture_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"📁 Created {capture_dir}")
@@ -66,7 +69,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
         if not timestamp:
             raise ValueError("Missing timestamp")
 
-        capture_dir = Path('Capture_Data') / f'capture_{timestamp}'
+        capture_dir = CAPTURE_BASE_DIR / f'capture_{timestamp}'
         if not capture_dir.exists():
             raise ValueError(f"Capture directory not found: {capture_dir}")
 
@@ -96,7 +99,7 @@ class CaptureHandler(BaseHTTPRequestHandler):
         if not index:
             raise ValueError("Missing index")
 
-        capture_dir = Path('Capture_Data') / f'capture_{timestamp}'
+        capture_dir = CAPTURE_BASE_DIR / f'capture_{timestamp}'
         if not capture_dir.exists():
             raise ValueError(f"Capture directory not found: {capture_dir}")
 
@@ -136,5 +139,5 @@ if __name__ == '__main__':
     server = HTTPServer(('127.0.0.1', port), CaptureHandler)
     print(f"🚀 Capture server running on http://127.0.0.1:{port}")
     print(f"   POST to http://127.0.0.1:{port}/capture?action=...")
-    print(f"   Captures saved to ./Capture_Data/")
+    print(f"   Captures saved to {CAPTURE_BASE_DIR}/")
     server.serve_forever()

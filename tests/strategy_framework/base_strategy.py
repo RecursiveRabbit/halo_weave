@@ -40,17 +40,53 @@ class ScoredSentence:
 class BrightnessStrategy(ABC):
     """Abstract base class for brightness scoring strategies"""
 
-    def __init__(self, capture_dir: Path, **kwargs):
+    def __init__(self, capture_dir: Path, export_file: Path = None, **kwargs):
         self.capture_dir = Path(capture_dir)
+        self.export_file = Path(export_file) if export_file else None
         self.parameters = kwargs
         self.metadata = self._load_metadata()
-        self.prompt_tokens = self.metadata.get('prompt_tokens', [])
+
+        # Load all tokens from export file if provided, otherwise use prompt_tokens
+        if self.export_file and self.export_file.exists():
+            self.all_tokens = self._load_tokens_from_export()
+            print(f"Loaded {len(self.all_tokens)} tokens from export: {self.export_file.name}")
+        else:
+            self.all_tokens = self.metadata.get('prompt_tokens', [])
+            print(f"Loaded {len(self.all_tokens)} prompt tokens from metadata")
+
+        # Keep prompt_tokens for backward compatibility
+        self.prompt_tokens = self.all_tokens
 
     def _load_metadata(self) -> dict:
         """Load metadata.json from capture directory"""
         metadata_file = self.capture_dir / 'metadata.json'
         with open(metadata_file, 'r') as f:
             return json.load(f)
+
+    def _load_tokens_from_export(self) -> List[dict]:
+        """
+        Load all tokens from halo_weave export JSON file.
+
+        Returns:
+            List of token dicts with position, text, turn_id, sentence_id, etc.
+        """
+        with open(self.export_file, 'r') as f:
+            export_data = json.load(f)
+
+        # Filter out deleted tokens
+        active_tokens = [
+            {
+                'position': token['position'],
+                'text': token['text'],
+                'turn_id': token['turn_id'],
+                'sentence_id': token['sentence_id'],
+                'message_role': token['message_role']
+            }
+            for token in export_data['tokens']
+            if not token.get('deleted', False)
+        ]
+
+        return active_tokens
 
     def _load_token_files(self) -> List[Path]:
         """Get sorted list of token JSON files"""

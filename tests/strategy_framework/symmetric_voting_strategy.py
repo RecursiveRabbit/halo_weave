@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Voting Strategy - Rolling Mean Voting System
+Symmetric Voting Strategy - Balanced increment/decrement voting
 
 For each generation step:
 1. Aggregate attention across layers/heads
 2. Calculate local mean attention
-3. Award +1 vote to each token above local mean
-4. Optional: Only count votes for tokens far from generation head (min_distance)
+3. If token attention > mean: score += 1
+4. If token attention <= mean: score -= 1
+5. Clamp score to [0, 255]
 
-Tokens with the most votes = Anchor tokens (consistently referenced)
+New tokens start at 255. A token ignored for 255 generations drops to 0.
+Tokens must "earn their keep" by being referenced to maintain brightness.
 """
 
 import json
@@ -20,37 +22,36 @@ import sys
 from base_strategy import BrightnessStrategy
 
 
-class VotingStrategy(BrightnessStrategy):
-    """Rolling mean voting - discrete vote counts"""
+class SymmetricVotingStrategy(BrightnessStrategy):
+    """Symmetric ±1 voting - natural decay mechanism"""
 
-    def __init__(self, capture_dir: Path, min_distance: int = 50, **kwargs):
+    def __init__(self, capture_dir: Path, **kwargs):
         """
         Args:
             capture_dir: Path to capture directory
-            min_distance: Only count votes for tokens at least this far behind generation head
         """
-        super().__init__(capture_dir, min_distance=min_distance, **kwargs)
+        super().__init__(capture_dir, **kwargs)
 
     def get_strategy_name(self) -> str:
-        return "Rolling Mean Voting"
+        return "Symmetric Voting (±1)"
 
     def compute_scores(self) -> dict:
         """
-        Compute vote count for each token.
+        Compute brightness score for each token with symmetric voting.
 
         Returns:
-            {position: vote_count} mapping
+            {position: score} mapping, scores in [0, 255]
         """
-        votes = defaultdict(int)
-        attention_sum = defaultdict(float)
-        attention_count = defaultdict(int)
+        # Initialize all tokens to 255
+        scores = {}
+        for token in self.all_tokens:
+            scores[token['position']] = 255
 
-        prompt_length = len(self.prompt_tokens)
         token_files = self._load_token_files()
 
         print(f"Analyzing {len(token_files)} generation steps...")
         print(f"Total context: {len(self.all_tokens)} tokens")
-        print(f"Min distance filter: {self.parameters['min_distance']} tokens\n")
+        print(f"Initial score: 255 (all tokens)\n")
 
         skipped = 0
         for idx, filepath in enumerate(token_files):
@@ -74,26 +75,19 @@ class VotingStrategy(BrightnessStrategy):
             # Calculate local mean for this step
             local_mean = np.mean(aggregated)
 
-            # Current generation position
-            current_position = shape[2]  # context_length from shape
-
-            # Award votes to tokens above mean
+            # Apply symmetric voting
             for pos_idx, attn_value in enumerate(aggregated):
                 # Map attention index to actual token position
                 if pos_idx < len(self.all_tokens):
                     actual_position = self.all_tokens[pos_idx]['position']
 
-                    # Min-distance filter: Only count votes for tokens far behind generation head
-                    if (current_position - pos_idx) < self.parameters['min_distance']:
-                        continue
-
-                    # Accumulate statistics
-                    attention_sum[actual_position] += attn_value
-                    attention_count[actual_position] += 1
-
-                    # Vote if above local mean
+                    # Symmetric voting: +1 if above mean, -1 if below
                     if attn_value > local_mean:
-                        votes[actual_position] += 1
+                        scores[actual_position] += 1
+                    else:
+                        scores[actual_position] -= 1
+
+                    # No clamping - let scores go where they want!
 
             # Progress indicator
             if (idx + 1) % 50 == 0:
@@ -102,32 +96,36 @@ class VotingStrategy(BrightnessStrategy):
         if skipped > 0:
             print(f"  Skipped {skipped} malformed files")
 
-        print(f"\nCompleted: {len(votes)} tokens scored")
+        print(f"\nCompleted: {len(scores)} tokens scored")
 
-        # Return votes as scores
-        return dict(votes)
+        # Print score distribution
+        score_values = list(scores.values())
+        print(f"Score distribution:")
+        print(f"  Min: {min(score_values)}, Max: {max(score_values)}")
+        print(f"  Mean: {np.mean(score_values):.2f}, Median: {np.median(score_values):.2f}")
+
+        return scores
 
 
 def main():
     """Standalone execution"""
     if len(sys.argv) < 2:
-        print("Usage: python3 voting_strategy.py <capture_dir> [min_distance] [export_file]")
+        print("Usage: python3 symmetric_voting_strategy.py <capture_dir> [export_file]")
         sys.exit(1)
 
     capture_dir = Path(sys.argv[1])
-    min_distance = int(sys.argv[2]) if len(sys.argv) > 2 else 50
-    export_file = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+    export_file = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 
     # Run strategy
-    strategy = VotingStrategy(capture_dir, export_file=export_file, min_distance=min_distance)
+    strategy = SymmetricVotingStrategy(capture_dir, export_file=export_file)
     sentences, metadata = strategy.run()
 
     # Export results
     output_dir = Path('test_results') / capture_dir.name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    strategy.export_markdown(sentences, metadata, output_dir / 'voting_strategy.md')
-    strategy.export_json(sentences, metadata, output_dir / 'voting_strategy.json')
+    strategy.export_markdown(sentences, metadata, output_dir / 'symmetric_voting_strategy.md')
+    strategy.export_json(sentences, metadata, output_dir / 'symmetric_voting_strategy.json')
 
     print(f"\n{'='*80}")
     print(f"Results written to: {output_dir}")

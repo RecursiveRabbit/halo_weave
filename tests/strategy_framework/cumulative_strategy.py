@@ -25,7 +25,7 @@ class CumulativeStrategy(BrightnessStrategy):
 
     def __init__(self,
                  capture_dir: Path,
-                 decay_rate: float = 0.003,
+                 decay_rate: float = 0.001,
                  decay_mode: str = 'additive',
                  distance_mode: str = 'logarithmic',
                  min_distance: int = 20,
@@ -105,7 +105,7 @@ class CumulativeStrategy(BrightnessStrategy):
         token_files = self._load_token_files()
 
         print(f"Analyzing {len(token_files)} generation steps...")
-        print(f"Prompt context: {prompt_length} tokens")
+        print(f"Total context: {len(self.all_tokens)} tokens")
         print(f"Decay: {self.parameters['decay_mode']} @ {self.parameters['decay_rate']}")
         print(f"Distance: {self.parameters['distance_mode']} (min={self.parameters['min_distance']}, scale={self.parameters['distance_scale']})\n")
 
@@ -128,16 +128,19 @@ class CumulativeStrategy(BrightnessStrategy):
             shape = data['attention']['shape']
             aggregated = self._aggregate_attention(attention_data, shape)
 
-            # Current generation position
+            # Current generation position (context length before adding new token)
             current_position = shape[2]
 
-            # Update scores for each token
+            # Update scores for each token in context
             for pos_idx, attn_value in enumerate(aggregated):
-                if pos_idx < prompt_length:
-                    actual_position = self.prompt_tokens[pos_idx]['position']
+                # Map attention index to actual token position
+                # pos_idx is the index in the attention tensor
+                # We need to find the token at that position in all_tokens
+                if pos_idx < len(self.all_tokens):
+                    actual_position = self.all_tokens[pos_idx]['position']
 
                     # Calculate distance from generation head
-                    distance = current_position - actual_position
+                    distance = current_position - pos_idx
 
                     # Apply distance weighting
                     weighted_attention = self._apply_distance_weight(attn_value, distance)
@@ -165,16 +168,18 @@ class CumulativeStrategy(BrightnessStrategy):
 def main():
     """Standalone execution"""
     if len(sys.argv) < 2:
-        print("Usage: python3 cumulative_strategy.py <capture_dir> [decay_rate] [min_distance]")
+        print("Usage: python3 cumulative_strategy.py <capture_dir> [decay_rate] [min_distance] [export_file]")
         sys.exit(1)
 
     capture_dir = Path(sys.argv[1])
-    decay_rate = float(sys.argv[2]) if len(sys.argv) > 2 else 0.003
+    decay_rate = float(sys.argv[2]) if len(sys.argv) > 2 else 0.001
     min_distance = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+    export_file = Path(sys.argv[4]) if len(sys.argv) > 4 else None
 
     # Run strategy
     strategy = CumulativeStrategy(
         capture_dir,
+        export_file=export_file,
         decay_rate=decay_rate,
         min_distance=min_distance
     )
