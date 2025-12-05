@@ -13,6 +13,18 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types"""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 class ScoredSentence:
     """Container for a sentence with its score"""
     def __init__(self, turn_id, sentence_id, role, tokens, score):
@@ -27,11 +39,11 @@ class ScoredSentence:
     def to_dict(self):
         """Convert to JSON-serializable dict"""
         return {
-            'turn_id': self.turn_id,
-            'sentence_id': self.sentence_id,
+            'turn_id': int(self.turn_id),
+            'sentence_id': int(self.sentence_id),
             'role': self.role,
             'score': float(self.score),
-            'token_count': self.token_count,
+            'token_count': int(self.token_count),
             'text': self.text,
             'tokens': self.tokens
         }
@@ -89,8 +101,58 @@ class BrightnessStrategy(ABC):
         return active_tokens
 
     def _load_token_files(self) -> List[Path]:
-        """Get sorted list of token JSON files"""
+        """
+        Get sorted list of token files.
+        
+        Supports both formats:
+        - Old: token_00000.json (combined JSON with attention data)
+        - New: token_00000_meta.json + token_00000_attn.bin (split format)
+        
+        Returns meta files for new format, full JSON for old format.
+        """
+        # Check for new binary format first
+        meta_files = sorted(self.capture_dir.glob('token_*_meta.json'))
+        if meta_files:
+            return meta_files
+        
+        # Fall back to old combined JSON format
         return sorted(self.capture_dir.glob('token_*.json'))
+
+    def _load_token_data(self, filepath: Path) -> dict:
+        """
+        Load token data from file, handling both old and new formats.
+        
+        Args:
+            filepath: Path to token file (either .json or _meta.json)
+            
+        Returns:
+            dict with keys: step, token_id, text, position, attention_shape, attention_data
+            attention_data is a numpy array (loaded from .bin for new format)
+        """
+        with open(filepath, 'r') as f:
+            meta = json.load(f)
+        
+        # Check if this is new format (has _meta.json suffix)
+        if filepath.name.endswith('_meta.json'):
+            # New binary format - load attention from .bin file
+            bin_path = filepath.with_name(filepath.name.replace('_meta.json', '_attn.bin'))
+            
+            if bin_path.exists() and meta.get('attention_shape'):
+                # Load raw binary as float32
+                attention_data = np.fromfile(bin_path, dtype=np.float32)
+                meta['attention_data'] = attention_data
+            else:
+                meta['attention_data'] = None
+        else:
+            # Old JSON format - attention embedded in JSON
+            if meta.get('attention') and meta['attention'].get('data'):
+                meta['attention_data'] = np.array(meta['attention']['data'], dtype=np.float32)
+                meta['attention_shape'] = meta['attention']['shape']
+            else:
+                meta['attention_data'] = None
+                meta['attention_shape'] = None
+        
+        return meta
 
     def _aggregate_attention(self, attention_data: List[float], shape: Tuple[int, int, int]) -> np.ndarray:
         """
@@ -127,14 +189,16 @@ class BrightnessStrategy(ABC):
         for token in self.prompt_tokens:
             pos = token['position']
             if pos in scored_tokens:
-                key = (token['turn_id'], token['sentence_id'], token['message_role'])
+                # Handle both old format (message_role) and new format (role)
+                role = token.get('message_role') or token.get('role', 'unknown')
+                key = (token['turn_id'], token['sentence_id'], role)
                 sentences[key].append({
                     'position': pos,
                     'text': token['text'],
                     'score': scored_tokens[pos],
                     'turn_id': token['turn_id'],
                     'sentence_id': token['sentence_id'],
-                    'role': token['message_role']
+                    'role': role
                 })
 
         # Create ScoredSentence objects with peak score per sentence
@@ -234,6 +298,6 @@ class BrightnessStrategy(ABC):
         }
 
         with open(output_file, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, cls=NumpyEncoder)
 
         print(f"Exported JSON: {output_file}")

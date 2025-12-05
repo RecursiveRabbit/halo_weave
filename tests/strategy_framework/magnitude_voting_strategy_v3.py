@@ -77,20 +77,19 @@ class MagnitudeVotingStrategyV3(BrightnessStrategy):
 
         for idx, filepath in enumerate(token_files):
             try:
-                with open(filepath, 'r') as f:
-                    data = json.load(f)
-            except json.JSONDecodeError:
-                print(f"  Warning: Skipping {filepath.name} - malformed JSON", file=sys.stderr)
+                data = self._load_token_data(filepath)
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"  Warning: Skipping {filepath.name} - {e}", file=sys.stderr)
                 skipped += 1
                 continue
 
             # Skip if no attention
-            if not data.get('attention') or not data['attention'].get('data'):
+            if data.get('attention_data') is None or data.get('attention_shape') is None:
                 continue
 
             # Aggregate attention for this generation step
-            attention_data = data['attention']['data']
-            shape = data['attention']['shape']
+            attention_data = data['attention_data']
+            shape = data['attention_shape']
             aggregated = self._aggregate_attention(attention_data, shape)
 
             # O(1) threshold calculation excluding BOS

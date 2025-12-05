@@ -15,6 +15,8 @@ from voting_strategy import VotingStrategy
 from cumulative_strategy import CumulativeStrategy
 from symmetric_voting_strategy import SymmetricVotingStrategy
 from magnitude_voting_strategy import MagnitudeVotingStrategy
+from magnitude_voting_strategy_v2 import MagnitudeVotingStrategyV2
+from magnitude_voting_strategy_v3 import MagnitudeVotingStrategyV3
 from base_strategy import ScoredSentence
 
 
@@ -61,11 +63,11 @@ def generate_comparison_report(strategies_results: Dict[str, tuple], output_file
             stats = metadata['score_stats']
             f.write(f"| {name} | {stats['min']:.2f} | {stats['max']:.2f} | {stats['mean']:.2f} | {stats['median']:.2f} |\n")
 
-        # Top 20 ranking comparison
-        f.write(f"\n## Top 20 Sentence Rankings\n\n")
+        # Bottom 10 ranking comparison (pruning candidates)
+        f.write(f"\n## Bottom 10 Sentence Rankings (Pruning Candidates)\n\n")
 
-        # Build rank table
-        max_rank = 20
+        # Build rank table - show lowest scored sentences
+        max_rank = 10
         f.write("| Rank | " + " | ".join(strategy_names) + " |\n")
         f.write("|------|" + "|".join(["---" for _ in strategy_names]) + "|\n")
 
@@ -73,25 +75,28 @@ def generate_comparison_report(strategies_results: Dict[str, tuple], output_file
             row = [f"{rank}"]
             for name in strategy_names:
                 sentences, _ = strategies_results[name]
-                if rank - 1 < len(sentences):
-                    s = sentences[rank - 1]
+                # Get from bottom of list (lowest scores)
+                idx = len(sentences) - rank
+                if idx >= 0:
+                    s = sentences[idx]
                     cell = f"T{s.turn_id}:S{s.sentence_id} ({s.score:.1f})"
                 else:
                     cell = "-"
                 row.append(cell)
             f.write("| " + " | ".join(row) + " |\n")
 
-        # Detailed sentence rankings for each strategy
+        # Detailed sentence rankings for each strategy - BOTTOM 30 (pruning candidates)
         f.write(f"\n{'='*80}\n")
-        f.write(f"## Detailed Rankings by Strategy\n")
+        f.write(f"## Detailed Rankings by Strategy (Bottom 30 - Pruning Candidates)\n")
         f.write(f"{'='*80}\n\n")
 
         for name, (sentences, metadata) in strategies_results.items():
             f.write(f"### {name}\n\n")
 
-            # Show top 30
-            for i, sentence in enumerate(sentences[:30], 1):
-                f.write(f"**Rank {i} - Turn {sentence.turn_id}, Sentence {sentence.sentence_id}** ")
+            # Show bottom 30 (lowest scores first)
+            bottom_30 = sentences[-30:][::-1]  # Reverse to show lowest first
+            for i, sentence in enumerate(bottom_30, 1):
+                f.write(f"**Prune Candidate {i} - Turn {sentence.turn_id}, Sentence {sentence.sentence_id}** ")
                 f.write(f"(Score: {sentence.score:.2f}, {sentence.token_count} tokens)\n")
                 f.write(f"```\n{sentence.text}\n```\n\n")
 
@@ -100,19 +105,20 @@ def generate_comparison_report(strategies_results: Dict[str, tuple], output_file
         f.write(f"## Agreement Analysis\n")
         f.write(f"{'='*80}\n\n")
 
-        # Find sentences that all strategies agree are top 10
+        # Find sentences that all strategies agree should be pruned (bottom 10)
         if len(strategies_results) > 1:
-            top_10_sets = []
+            bottom_10_sets = []
             for name, (sentences, _) in strategies_results.items():
-                top_10 = set((s.turn_id, s.sentence_id) for s in sentences[:10])
-                top_10_sets.append((name, top_10))
+                # Get bottom 10 (lowest scores)
+                bottom_10 = set((s.turn_id, s.sentence_id) for s in sentences[-10:])
+                bottom_10_sets.append((name, bottom_10))
 
-            # Find intersection
-            common = top_10_sets[0][1]
-            for _, s in top_10_sets[1:]:
+            # Find intersection - sentences ALL strategies would prune
+            common = bottom_10_sets[0][1]
+            for _, s in bottom_10_sets[1:]:
                 common &= s
 
-            f.write(f"**Sentences in ALL strategies' top 10:**\n\n")
+            f.write(f"**Sentences ALL strategies agree to prune (bottom 10):**\n\n")
             if common:
                 for turn_id, sentence_id in sorted(common):
                     # Get text from first strategy
@@ -120,18 +126,18 @@ def generate_comparison_report(strategies_results: Dict[str, tuple], output_file
                         if s.turn_id == turn_id and s.sentence_id == sentence_id:
                             f.write(f"- Turn {turn_id}, Sentence {sentence_id}: `{format_sentence_preview(s)}`\n")
             else:
-                f.write("None - strategies disagree significantly!\n")
+                f.write("None - strategies disagree on what to prune!\n")
 
             f.write("\n")
 
-        # Disagreement analysis - sentences in one strategy's top 10 but not others
+        # Disagreement analysis - sentences only one strategy would prune
         if len(strategies_results) > 1:
-            f.write(f"**Unique to each strategy's top 10:**\n\n")
-            for i, (name, top_10) in enumerate(top_10_sets):
-                unique = top_10.copy()
-                for j, (other_name, other_top_10) in enumerate(top_10_sets):
+            f.write(f"**Unique pruning candidates (only this strategy's bottom 10):**\n\n")
+            for i, (name, bottom_10) in enumerate(bottom_10_sets):
+                unique = bottom_10.copy()
+                for j, (other_name, other_bottom_10) in enumerate(bottom_10_sets):
                     if i != j:
-                        unique -= other_top_10
+                        unique -= other_bottom_10
 
                 f.write(f"**{name} only:**\n")
                 if unique:
@@ -203,13 +209,29 @@ def main():
     strategy.export_json(sentences, metadata, output_dir / 'symmetric_voting_strategy.json')
     strategies_results['Symmetric Voting'] = (sentences, metadata)
 
-    # Strategy 4: Magnitude-Weighted Voting
+    # Strategy 4: Magnitude-Weighted Voting (v1)
     print("\n" + "="*80)
     strategy = MagnitudeVotingStrategy(capture_dir, export_file=export_file)
     sentences, metadata = strategy.run()
-    strategy.export_markdown(sentences, metadata, output_dir / 'magnitude_voting_strategy.md')
-    strategy.export_json(sentences, metadata, output_dir / 'magnitude_voting_strategy.json')
-    strategies_results['Magnitude Voting'] = (sentences, metadata)
+    strategy.export_markdown(sentences, metadata, output_dir / 'magnitude_voting_v1.md')
+    strategy.export_json(sentences, metadata, output_dir / 'magnitude_voting_v1.json')
+    strategies_results['Magnitude v1'] = (sentences, metadata)
+
+    # Strategy 5: Magnitude-Weighted Voting v2 (BOS exclusion)
+    print("\n" + "="*80)
+    strategy = MagnitudeVotingStrategyV2(capture_dir, export_file=export_file)
+    sentences, metadata = strategy.run()
+    strategy.export_markdown(sentences, metadata, output_dir / 'magnitude_voting_v2.md')
+    strategy.export_json(sentences, metadata, output_dir / 'magnitude_voting_v2.json')
+    strategies_results['Magnitude v2'] = (sentences, metadata)
+
+    # Strategy 6: Magnitude-Weighted Voting v3 (fully vectorized)
+    print("\n" + "="*80)
+    strategy = MagnitudeVotingStrategyV3(capture_dir, export_file=export_file)
+    sentences, metadata = strategy.run()
+    strategy.export_markdown(sentences, metadata, output_dir / 'magnitude_voting_v3.md')
+    strategy.export_json(sentences, metadata, output_dir / 'magnitude_voting_v3.json')
+    strategies_results['Magnitude v3'] = (sentences, metadata)
 
     # Generate comparison report
     print("\n" + "="*80)
@@ -221,15 +243,13 @@ def main():
     print(f"{'='*80}")
     print(f"\nAll results written to: {output_dir}/")
     print(f"\nFiles generated:")
-    print(f"  - voting_strategy.md (human-readable)")
-    print(f"  - voting_strategy.json (machine-readable)")
-    print(f"  - cumulative_strategy.md (human-readable)")
-    print(f"  - cumulative_strategy.json (machine-readable)")
-    print(f"  - symmetric_voting_strategy.md (human-readable)")
-    print(f"  - symmetric_voting_strategy.json (machine-readable)")
-    print(f"  - magnitude_voting_strategy.md (human-readable)")
-    print(f"  - magnitude_voting_strategy.json (machine-readable)")
-    print(f"  - comparison_report.md (side-by-side analysis)")
+    print(f"  - voting_strategy.md/json")
+    print(f"  - cumulative_strategy.md/json")
+    print(f"  - symmetric_voting_strategy.md/json")
+    print(f"  - magnitude_voting_v1.md/json")
+    print(f"  - magnitude_voting_v2.md/json")
+    print(f"  - magnitude_voting_v3.md/json")
+    print(f"  - comparison_report.md (bottom 10 pruning analysis)")
 
 
 if __name__ == '__main__':

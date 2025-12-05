@@ -41,9 +41,21 @@ class CaptureHandler(BaseHTTPRequestHandler):
             elif action == 'write_metadata':
                 self._handle_write_metadata(timestamp)
             elif action == 'write_token':
+                # Legacy: combined JSON (deprecated)
                 self._handle_write_token(timestamp, params)
+            elif action == 'write_token_meta':
+                # New: small JSON metadata only
+                self._handle_write_token_meta(timestamp, params)
+            elif action == 'write_token_attn':
+                # New: raw binary attention tensor
+                self._handle_write_token_attn(timestamp, params)
+            elif action == 'write_state':
+                self._handle_write_state(timestamp)
+            elif action == 'ping':
+                # Health check endpoint
+                self._send_json_response({'status': 'ok'})
             else:
-                self.send_error(400, f"Unknown action: {action}")
+                self._send_error_with_cors(400, f"Unknown action: {action}")
 
         except Exception as e:
             print(f"❌ Error: {e}")
@@ -122,6 +134,92 @@ class CaptureHandler(BaseHTTPRequestHandler):
             'file': str(token_file)
         })
 
+    def _handle_write_token_meta(self, timestamp, params):
+        """Write token metadata JSON (small, ~200 bytes)"""
+        if not timestamp:
+            raise ValueError("Missing timestamp")
+
+        index = params.get('index', [''])[0]
+        if not index:
+            raise ValueError("Missing index")
+
+        capture_dir = CAPTURE_BASE_DIR / f'capture_{timestamp}'
+        if not capture_dir.exists():
+            raise ValueError(f"Capture directory not found: {capture_dir}")
+
+        # Read JSON body
+        content_length = int(self.headers['Content-Length'])
+        body = self.rfile.read(content_length)
+        meta_data = json.loads(body)
+
+        # Write metadata file
+        meta_file = capture_dir / f'token_{int(index):05d}_meta.json'
+        with open(meta_file, 'w') as f:
+            json.dump(meta_data, f)
+
+        self._send_json_response({
+            'success': True,
+            'file': str(meta_file)
+        })
+
+    def _handle_write_token_attn(self, timestamp, params):
+        """Write raw binary attention tensor (fast!)"""
+        if not timestamp:
+            raise ValueError("Missing timestamp")
+
+        index = params.get('index', [''])[0]
+        if not index:
+            raise ValueError("Missing index")
+
+        capture_dir = CAPTURE_BASE_DIR / f'capture_{timestamp}'
+        if not capture_dir.exists():
+            raise ValueError(f"Capture directory not found: {capture_dir}")
+
+        # Read raw binary body
+        content_length = int(self.headers['Content-Length'])
+        binary_data = self.rfile.read(content_length)
+
+        # Write binary file directly - no parsing, no serialization!
+        attn_file = capture_dir / f'token_{int(index):05d}_attn.bin'
+        with open(attn_file, 'wb') as f:
+            f.write(binary_data)
+
+        # Progress indicator every 10 tokens
+        if int(index) % 10 == 0:
+            print(f"💾 Token {index}: {len(binary_data):,} bytes")
+
+        self._send_json_response({
+            'success': True,
+            'file': str(attn_file),
+            'bytes': len(binary_data)
+        })
+
+    def _handle_write_state(self, timestamp):
+        """Write conversation state snapshot"""
+        if not timestamp:
+            raise ValueError("Missing timestamp")
+
+        capture_dir = CAPTURE_BASE_DIR / f'capture_{timestamp}'
+        if not capture_dir.exists():
+            raise ValueError(f"Capture directory not found: {capture_dir}")
+
+        # Read JSON body
+        content_length = int(self.headers['Content-Length'])
+        body = self.rfile.read(content_length)
+        state_data = json.loads(body)
+
+        # Write state file
+        state_file = capture_dir / 'conversation_state.json'
+        with open(state_file, 'w') as f:
+            json.dump(state_data, f, indent=2)
+
+        print(f"📸 Wrote {state_file.name}")
+
+        self._send_json_response({
+            'success': True,
+            'file': str(state_file)
+        })
+
     def _send_json_response(self, data):
         """Send JSON response with CORS"""
         self.send_response(200)
@@ -129,6 +227,14 @@ class CaptureHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
+
+    def _send_error_with_cors(self, code, message):
+        """Send error response with CORS headers"""
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps({'error': message}).encode())
 
     def log_message(self, format, *args):
         """Suppress default logging"""
