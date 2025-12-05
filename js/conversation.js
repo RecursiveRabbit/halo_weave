@@ -29,6 +29,11 @@ export class Conversation {
         
         // Sentence tracking within current turn
         this.currentSentenceId = 0;
+        
+        // === OPTIMIZATION: Cached active token list ===
+        // Invalidated on add/delete, rebuilt lazily
+        this._activeTokensCache = null;
+        this._activeTokenCount = 0;
     }
 
     // ========== Token Management ==========
@@ -76,6 +81,13 @@ export class Conversation {
         
         this.tokens.push(token);
         
+        // Invalidate cache and update count
+        // Optimization: append to cache instead of full invalidate
+        if (this._activeTokensCache !== null) {
+            this._activeTokensCache.push(token);
+            this._activeTokenCount++;
+        }
+        
         // Detect sentence boundaries for NEXT token
         this._updateSentenceBoundary(text);
         
@@ -103,10 +115,43 @@ export class Conversation {
     }
 
     /**
-     * Get all active (non-deleted) tokens
+     * Get all active (non-deleted) tokens (cached)
      */
     getActiveTokens() {
-        return this.tokens.filter(t => !t.deleted);
+        if (this._activeTokensCache === null) {
+            this._rebuildActiveCache();
+        }
+        return this._activeTokensCache;
+    }
+    
+    /**
+     * Get count of active tokens (O(1) when cached)
+     */
+    getActiveTokenCount() {
+        if (this._activeTokensCache === null) {
+            this._rebuildActiveCache();
+        }
+        return this._activeTokenCount;
+    }
+    
+    /**
+     * Rebuild active token cache
+     */
+    _rebuildActiveCache() {
+        this._activeTokensCache = [];
+        for (let i = 0; i < this.tokens.length; i++) {
+            if (!this.tokens[i].deleted) {
+                this._activeTokensCache.push(this.tokens[i]);
+            }
+        }
+        this._activeTokenCount = this._activeTokensCache.length;
+    }
+    
+    /**
+     * Invalidate active token cache (call after add/delete)
+     */
+    _invalidateCache() {
+        this._activeTokensCache = null;
     }
 
     /**
@@ -131,7 +176,7 @@ export class Conversation {
 
     /**
      * Update brightness scores using magnitude voting algorithm
-     * @param {Object} attention - {data: Float32Array, shape: [layers, heads, contextLen]}
+     * @param {Object} attention - {data: Float32Array, shape: [layers, heads, contextLen], preAggregated?: boolean}
      */
     updateBrightness(attention) {
         // Build active token list with positions in one pass
@@ -145,8 +190,10 @@ export class Conversation {
         const contextLen = activeTokens.length;
         if (contextLen < 2) return;  // Need at least BOS + 1 token
         
-        // Aggregate attention across layers/heads
-        const aggregated = this._aggregateAttention(attention);
+        // Use pre-aggregated data if available, otherwise aggregate client-side
+        const aggregated = attention.preAggregated 
+            ? attention.data 
+            : this._aggregateAttention(attention);
         
         // O(1) threshold calculation excluding BOS
         const bosAttention = aggregated[0];
@@ -179,7 +226,7 @@ export class Conversation {
 
     /**
      * Aggregate attention across layers and heads (mean)
-     * Optimized: single pass through data array
+     * Optimized: no modulo, process in contextLen-sized chunks
      */
     _aggregateAttention(attention) {
         const [layers, heads, contextLen] = attention.shape;
@@ -187,16 +234,19 @@ export class Conversation {
         const result = new Float32Array(contextLen);
         
         const totalHeads = layers * heads;
+        const scale = 1 / totalHeads;
         
-        // Single pass: iterate through flat array once
+        // Process in chunks of contextLen (one head at a time)
         // Data layout: [layer0_head0_tokens..., layer0_head1_tokens..., ...]
-        for (let idx = 0; idx < data.length; idx++) {
-            const tokenPos = idx % contextLen;
-            result[tokenPos] += data[idx];
+        // This avoids modulo by iterating in natural chunk boundaries
+        let offset = 0;
+        for (let h = 0; h < totalHeads; h++) {
+            for (let i = 0; i < contextLen; i++) {
+                result[i] += data[offset++];
+            }
         }
         
-        // Divide by total heads
-        const scale = 1 / totalHeads;
+        // Scale in separate pass (better cache locality)
         for (let i = 0; i < contextLen; i++) {
             result[i] *= scale;
         }
@@ -214,29 +264,31 @@ export class Conversation {
     pruneToFit(maxTokens) {
         let pruned = 0;
         
-        while (this.getActiveTokens().length > maxTokens) {
+        while (this.getActiveTokenCount() > maxTokens) {
             const sentences = this.getSentences();
-            const activeSentences = sentences.filter(s => !s.fullyDeleted);
             
-            if (activeSentences.length <= 1) break;  // Keep at least one sentence
-            
-            // Find sentence with lowest peak brightness
-            // Skip system prompt (turn_id 0, role system) - never prune
-            const prunableSentences = activeSentences.filter(s => 
-                !(s.turn_id === 0 && s.role === 'system')
-            );
-            
-            if (prunableSentences.length === 0) break;
-            
+            // Find lowest prunable sentence in single pass
             let lowestSentence = null;
             let lowestPeak = Infinity;
+            let activeSentenceCount = 0;
             
-            for (const sentence of prunableSentences) {
-                if (sentence.peakBrightness < lowestPeak) {
-                    lowestPeak = sentence.peakBrightness;
-                    lowestSentence = sentence;
+            for (let i = 0; i < sentences.length; i++) {
+                const s = sentences[i];
+                if (s.fullyDeleted) continue;
+                
+                activeSentenceCount++;
+                
+                // Skip system prompt (turn_id 0, role system) - never prune
+                if (s.turn_id === 0 && s.role === 'system') continue;
+                
+                if (s.peakBrightness < lowestPeak) {
+                    lowestPeak = s.peakBrightness;
+                    lowestSentence = s;
                 }
             }
+            
+            // Keep at least one sentence
+            if (activeSentenceCount <= 1) break;
             
             if (lowestSentence) {
                 this._deleteSentence(lowestSentence);
@@ -262,34 +314,46 @@ export class Conversation {
                 token.brightness_at_deletion = token.brightness;
             }
         }
+        // Invalidate cache after deletion
+        this._invalidateCache();
     }
 
     /**
      * Get all sentences with metadata
+     * Optimized: numeric key instead of string concatenation
      */
     getSentences() {
         const sentenceMap = new Map();
         
-        for (const token of this.tokens) {
-            const key = `${token.turn_id}-${token.sentence_id}-${token.role}`;
+        // Role to number mapping (avoid string in key)
+        const roleNum = { system: 0, user: 1, assistant: 2 };
+        
+        for (let i = 0; i < this.tokens.length; i++) {
+            const token = this.tokens[i];
+            // Numeric key: turn_id * 1000000 + sentence_id * 10 + role
+            // Supports up to 1M turns, 100K sentences per turn, 10 roles
+            const key = token.turn_id * 1000000 + token.sentence_id * 10 + (roleNum[token.role] || 0);
             
-            if (!sentenceMap.has(key)) {
-                sentenceMap.set(key, {
+            let sentence = sentenceMap.get(key);
+            if (sentence === undefined) {
+                sentence = {
                     turn_id: token.turn_id,
                     sentence_id: token.sentence_id,
                     role: token.role,
                     tokens: [],
                     peakBrightness: -Infinity,
                     fullyDeleted: true
-                });
+                };
+                sentenceMap.set(key, sentence);
             }
             
-            const sentence = sentenceMap.get(key);
             sentence.tokens.push(token);
             
             if (!token.deleted) {
                 sentence.fullyDeleted = false;
-                sentence.peakBrightness = Math.max(sentence.peakBrightness, token.brightness);
+                if (token.brightness > sentence.peakBrightness) {
+                    sentence.peakBrightness = token.brightness;
+                }
             }
         }
         
@@ -300,20 +364,43 @@ export class Conversation {
 
     /**
      * Get statistics
+     * Optimized: single pass, no intermediate arrays
      */
     getStats() {
         const active = this.getActiveTokens();
-        const brightnesses = active.map(t => t.brightness);
+        const len = active.length;
+        
+        if (len === 0) {
+            return {
+                totalTokens: this.tokens.length,
+                activeTokens: 0,
+                deletedTokens: this.tokens.length,
+                turns: this.currentTurnId,
+                minBrightness: 0,
+                maxBrightness: 0,
+                avgBrightness: 0
+            };
+        }
+        
+        let min = active[0].brightness;
+        let max = min;
+        let sum = min;
+        
+        for (let i = 1; i < len; i++) {
+            const b = active[i].brightness;
+            if (b < min) min = b;
+            if (b > max) max = b;
+            sum += b;
+        }
         
         return {
             totalTokens: this.tokens.length,
-            activeTokens: active.length,
-            deletedTokens: this.tokens.length - active.length,
+            activeTokens: len,
+            deletedTokens: this.tokens.length - len,
             turns: this.currentTurnId,
-            minBrightness: brightnesses.length ? Math.min(...brightnesses) : 0,
-            maxBrightness: brightnesses.length ? Math.max(...brightnesses) : 0,
-            avgBrightness: brightnesses.length ? 
-                Math.round(brightnesses.reduce((a, b) => a + b, 0) / brightnesses.length) : 0
+            minBrightness: min,
+            maxBrightness: max,
+            avgBrightness: Math.round(sum / len)
         };
     }
 
@@ -333,6 +420,8 @@ export class Conversation {
         this.currentTurnId = 0;
         this.currentRole = null;
         this.currentSentenceId = 0;
+        this._activeTokensCache = null;
+        this._activeTokenCount = 0;
     }
 
     /**

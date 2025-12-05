@@ -159,21 +159,23 @@ export class KoboldClient {
                         }
                     } else if (data.type === 'done') {
                         const elapsed = (performance.now() - startTime) / 1000;
-                        console.log(`🚀 WebSocket streaming: ${tokenCount} tokens in ${elapsed.toFixed(1)}s (${(tokenCount/elapsed).toFixed(1)} tok/s)`);
+                        console.log(`🚀 WebSocket: ${tokenCount} tokens in ${elapsed.toFixed(1)}s (${(tokenCount/elapsed).toFixed(1)} tok/s)`);
                         pendingToken = null;
                         ws.close();
                         onDone(data);
                         resolve();
                     }
                 } else {
-                    // Binary frame - raw float32 attention data
-                    const floats = new Float32Array(event.data);  // Zero-copy!
-                    const contextLen = floats.length / (numLayers * numHeads);
+                    // Binary frame - pre-aggregated float32 attention data
+                    // Server already computed mean(axis=(0,1)), so shape is just [contextLen]
+                    const floats = new Float32Array(event.data);
+                    const contextLen = floats.length;
                     
                     const attention = {
                         data: floats,
-                        shape: [numLayers, numHeads, contextLen],
-                        contextLength: contextLen
+                        shape: [1, 1, contextLen],  // Pretend 1 layer, 1 head for compatibility
+                        contextLength: contextLen,
+                        preAggregated: true  // Flag for client to skip aggregation
                     };
                     
                     // Deliver token with attention

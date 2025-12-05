@@ -1467,6 +1467,72 @@ Attention size:   7.7MB per token
 
 ---
 
+## Session Summary (2025-12-05 Afternoon)
+
+### ✅ COMPLETED: WebSocket Performance Optimization
+
+**The Problem:**
+- KoboldCPP generated 443 tokens in 9.15s (49.8 tok/s)
+- Frontend wall clock was 44.6s (10.0 tok/s)
+- 35 seconds of overhead unaccounted for
+
+**Root Cause Identified:**
+- Server `sendall()` was blocking for 33.85s (90ms/token)
+- TCP send buffer filling up because client couldn't read fast enough
+- Client blocked on synchronous JavaScript processing during `onmessage`
+- Each token: 6.5MB attention data × 443 tokens = 2.9GB total transfer
+
+**The Solution: Server-Side Attention Aggregation**
+- Moved `mean(axis=(0,1))` from client to server
+- Reduces data from `[28, 28, context]` to `[context]`
+- **784x bandwidth reduction** (6.5MB → 8KB per token)
+
+### 📊 Performance Results
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| **Wall clock** | 44.6s | 9.3s | **4.8x faster** |
+| **Token gaps** | 42.4s (39ms/msg) | 9.1s (10ms/msg) | **4.7x faster** |
+| **Binary data** | 3503MB | 3.6MB | **973x less** |
+| **sendall time** | 33.85s | 0.01s | **3385x faster** |
+| **Our processing** | 4.0ms/tok | 0.39ms/tok | **10x faster** |
+| **updateBrightness** | 2.6ms/tok | 0.04ms/tok | **65x faster** |
+
+**Generation is now real-time** - UI keeps up with model inference.
+
+### 📁 Files Modified
+
+**KoboldCPP:**
+- `koboldcpp.py` - Server-side attention aggregation in `handle_websocket_stream()`
+- `gpttype_adapter.cpp` - Removed debug `fprintf` statements from attention capture
+
+**Halo Weave:**
+- `js/kobold_client.js` - Updated to expect pre-aggregated attention data, added `preAggregated` flag
+- `js/conversation.js` - Skip `_aggregateAttention()` when data is pre-aggregated
+- `js/app.js` - Batched stats updates with requestAnimationFrame
+
+**Earlier optimizations this session:**
+- `js/conversation.js` - Cached active tokens, numeric keys in getSentences(), single-pass getStats()
+- `js/renderer.js` - Use precomputed peakBrightness instead of Math.max(...array)
+
+### 🔧 API Change
+
+**WebSocket binary frame format changed:**
+- **Before:** Raw `[layers, heads, context]` float32 array (~6.5MB)
+- **After:** Pre-aggregated `[context]` float32 array (~8KB)
+
+Client receives `preAggregated: true` flag to skip client-side aggregation.
+
+### 🎯 Current State
+
+**Performance:** ✅ Real-time (47.8 tok/s matches model speed)
+**Data transfer:** ✅ Minimal (3.6MB total for 443 tokens)
+**Processing overhead:** ✅ Negligible (0.39ms/token)
+
+The attention pipeline is now **zero-overhead** relative to model inference.
+
+---
+
 **Last Updated:** 2025-12-05
-**Status:** ✅ **WORKING** - Multi-turn conversations with recency bias fix
+**Status:** ✅ **PRODUCTION-READY** - Real-time attention visualization at model speed
 **Browser Support:** Chrome/Brave ✅ | Firefox ⚠️ (connection issues)

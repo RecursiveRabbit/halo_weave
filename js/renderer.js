@@ -65,14 +65,15 @@ export class Renderer {
     _doUpdateColors(conversation) {
         const sentences = conversation.getSentences();
         
-        for (const sentence of sentences) {
+        for (let s = 0; s < sentences.length; s++) {
+            const sentence = sentences[s];
             if (sentence.fullyDeleted) continue;
             
-            const activeTokens = sentence.tokens.filter(t => !t.deleted);
-            if (activeTokens.length === 0) continue;
+            // peakBrightness already computed by getSentences()
+            const peakBrightness = sentence.peakBrightness;
+            if (peakBrightness === -Infinity) continue;  // No active tokens
             
-            const sentenceKey = `${sentence.turn_id}:${sentence.sentence_id}`;
-            const peakBrightness = Math.max(...activeTokens.map(t => t.brightness));
+            const sentenceKey = sentence.turn_id * 1000 + sentence.sentence_id;  // Numeric key
             
             // Check if paragraph peak changed (affects all non-bright tokens)
             const lastPeak = this.lastParagraphPeak.get(sentenceKey);
@@ -230,11 +231,8 @@ export class Renderer {
             sentenceEl.classList.add('deleted');
         }
         
-        // Calculate peak brightness for paragraph color
-        const activeTokens = sentence.tokens.filter(t => !t.deleted);
-        const peakBrightness = activeTokens.length > 0 
-            ? Math.max(...activeTokens.map(t => t.brightness))
-            : 255;
+        // Use peakBrightness already computed by getSentences()
+        const peakBrightness = sentence.peakBrightness !== -Infinity ? sentence.peakBrightness : 255;
         const paragraphColor = this._brightnessToYellow(peakBrightness);
         
         // Render tokens

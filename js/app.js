@@ -25,6 +25,7 @@ class App {
         this.isGenerating = false;
         this.generationStep = 0;
         this.totalPruned = 0;
+        this._statsPending = false;  // Coalesce stats updates with rAF
         
         // DOM elements
         this.elements = {
@@ -427,13 +428,20 @@ class App {
     }
 
     _updateStats() {
-        const stats = this.conversation.getStats();
-        this.elements.statTokens.textContent = stats.activeTokens;
-        this.elements.statBrightness.textContent = 
-            stats.activeTokens > 0 
-                ? `${stats.minBrightness} - ${stats.maxBrightness}` 
-                : '-';
-        this.elements.statPruned.textContent = this.totalPruned;
+        // Coalesce multiple calls per frame
+        if (this._statsPending) return;
+        this._statsPending = true;
+        
+        requestAnimationFrame(() => {
+            this._statsPending = false;
+            const stats = this.conversation.getStats();
+            this.elements.statTokens.textContent = stats.activeTokens;
+            this.elements.statBrightness.textContent = 
+                stats.activeTokens > 0 
+                    ? `${stats.minBrightness} - ${stats.maxBrightness}` 
+                    : '-';
+            this.elements.statPruned.textContent = this.totalPruned;
+        });
     }
 
     _setStatus(text, className) {
