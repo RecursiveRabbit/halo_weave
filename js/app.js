@@ -16,7 +16,7 @@ import { DataCapture } from './data_capture.js';
 class App {
     constructor() {
         // Core components
-        this.client = new KoboldClient('http://localhost:5001');
+        this.client = new KoboldClient('http://127.0.0.1:5001');
         this.conversation = new Conversation();
         this.renderer = new Renderer(document.getElementById('tokens'));
         this.capture = new DataCapture();
@@ -115,6 +115,7 @@ class App {
         const text = this.elements.userInput.value.trim();
         if (!text || this.isGenerating) return;
         
+        console.log('📤 _handleSend starting');
         this.elements.userInput.value = '';
         this.isGenerating = true;
         this.elements.btnSend.disabled = true;
@@ -124,12 +125,16 @@ class App {
             if (this.conversation.tokens.length === 0) {
                 const systemPrompt = this.elements.systemPrompt.value.trim();
                 if (systemPrompt) {
+                    console.log('📤 Adding system prompt...');
                     await this._addMessage('system', systemPrompt);
+                    console.log('📤 System prompt added');
                 }
             }
             
             // Add user message
+            console.log('📤 Adding user message...');
             await this._addMessage('user', text);
+            console.log('📤 User message added, starting generation...');
             
             // Generate response
             await this._generate();
@@ -313,14 +318,21 @@ class App {
             );
         });
         
-        // Add end token
-        const endTokens = await this.client.tokenize('<|im_end|>\n');
-        for (const t of endTokens) {
-            const token = this.conversation.addStreamingToken(t.token_id, t.text);
-            this.renderer.addToken(token, this.conversation);
-        }
+        console.log('🔓 Generation Promise resolved');
+        
+        // TODO: End token tokenization is hanging - skip for now
+        // try {
+        //     const endTokens = await this.client.tokenize('<|im_end|>\n');
+        //     for (const t of endTokens) {
+        //         const token = this.conversation.addStreamingToken(t.token_id, t.text);
+        //         this.renderer.addToken(token, this.conversation);
+        //     }
+        // } catch (err) {
+        //     console.warn('Failed to add end token:', err);
+        // }
         
         this._updateStats();
+        console.log('🔓 _generate() complete');
     }
 
     _checkPruning() {

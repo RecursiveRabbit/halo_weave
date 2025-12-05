@@ -36,23 +36,39 @@ export class KoboldClient {
      * @returns {Promise<Array>} Array of {token_id, text}
      */
     async tokenize(text, addSpecialTokens = false) {
-        const response = await fetch(`${this.baseUrl}/api/v1/tokenize`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                text: text,
-                add_special_tokens: addSpecialTokens
-            })
-        });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        
+        try {
+            console.log('🔤 tokenize() starting...');
+            const response = await fetch(`${this.baseUrl}/api/v1/tokenize`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    text: text,
+                    add_special_tokens: addSpecialTokens
+                }),
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            console.log('🔤 tokenize() got response:', response.status);
 
-        if (!response.ok) {
-            throw new Error(`Tokenization failed: ${response.statusText}`);
+            if (!response.ok) {
+                throw new Error(`Tokenization failed: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            console.log('🔤 tokenize() complete, got', data.tokens?.length, 'tokens');
+            return data.tokens;  // Array of {token_id, text}
+        } catch (err) {
+            clearTimeout(timeoutId);
+            if (err.name === 'AbortError') {
+                throw new Error('Tokenization timed out after 5s');
+            }
+            throw err;
         }
-
-        const data = await response.json();
-        return data.tokens;  // Array of {token_id, text}
     }
 
     /**
@@ -144,6 +160,7 @@ export class KoboldClient {
                     } else if (data.type === 'done') {
                         const elapsed = (performance.now() - startTime) / 1000;
                         console.log(`🚀 WebSocket streaming: ${tokenCount} tokens in ${elapsed.toFixed(1)}s (${(tokenCount/elapsed).toFixed(1)} tok/s)`);
+                        pendingToken = null;
                         ws.close();
                         onDone(data);
                         resolve();

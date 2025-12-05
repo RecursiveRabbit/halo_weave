@@ -156,9 +156,15 @@ export class Conversation {
         if (threshold <= 0 || !isFinite(threshold)) return;
         
         // Update scores for non-BOS tokens (activeTokens[i] is already the token)
+        // Skip current turn tokens - they're in their local attention wave
         const len = Math.min(aggregated.length, contextLen);
         for (let i = 1; i < len; i++) {
             const token = activeTokens[i];
+            
+            // Skip current turn - these tokens get massive local attention
+            // They'll start competing fairly on the next turn
+            if (token.turn_id === this.currentTurnId) continue;
+            
             const att = aggregated[i];
             
             if (att > threshold) {
@@ -253,6 +259,7 @@ export class Conversation {
                 token.role === sentence.role &&
                 !token.deleted) {
                 token.deleted = true;
+                token.brightness_at_deletion = token.brightness;
             }
         }
     }

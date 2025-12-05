@@ -1373,6 +1373,100 @@ The attention pipeline is now production-ready. Model inference is the only bott
 
 ---
 
+## Session Summary (2025-12-05)
+
+### ✅ COMPLETED
+
+1. **Recency Bias Fix - WORKING**
+   - Problem: Current turn tokens appeared overly bright due to high local self-attention
+   - Solution: Skip scoring for tokens with `turn_id === currentTurnId`
+   - Result: Current turn stays yellow (255), previous turns show differentiated brightness
+   - Location: `js/conversation.js` line 166
+
+2. **Multi-Turn Conversations - WORKING**
+   - Fixed critical bug: `localhost` vs `127.0.0.1` mismatch was blocking HTTP requests
+   - Browser treats these as different origins with separate connection pools
+   - Changed `app.js` to use `http://127.0.0.1:5001` consistently
+   - Multi-turn now works reliably in Chrome/Brave
+
+3. **Git Housekeeping**
+   - Committed missing `index.html` and `css/style.css` from UI rewrite
+   - Deleted obsolete files: `attention_tracker.js`, `conversation_state.js`, `heatmap.js`
+   - Updated test framework files
+   - Repository now clean and consistent
+
+4. **UI Improvements**
+   - Increased max tokens slider to 2048 (was 512)
+   - Added `brightness_at_deletion` field to preserve scores when tokens are pruned
+   - Removed debug logging and delays from production code
+
+### ⚠️ KNOWN ISSUES
+
+1. **Firefox Connection Bug**
+   - Firefox has intermittent connection issues with our WebSocket/HTTP mix
+   - Tokenize requests timeout randomly after WebSocket generation
+   - Works fine in Chrome/Brave
+   - Root cause: Unknown (possibly Firefox connection pool handling)
+   - Workaround: Use Chrome/Brave for now
+
+2. **Stale Connections**
+   - Multiple browser sessions can leave stale connections to KoboldCPP
+   - Symptom: Tokenize requests hang on fresh page load
+   - Fix: Restart KoboldCPP to clear connection pool
+   - Long-term: May need `Connection: close` headers or connection management
+
+3. **Performance Scales with Context**
+   - Small context (350 tokens, 2.3MB attention): 26ms/token ✅
+   - Large context (1765 tokens, 7.7MB attention): 72ms/token ⚠️
+   - This is expected - more data to transfer per token
+   - Optimization opportunity for next session
+
+### 📊 Current Performance
+
+**Small context (350 tokens):**
+```
+Wall clock:       5.9s (27.7ms/token)
+Token gaps:       5.6s (25.9ms/token)
+Our processing:   358ms (1.66ms/token)
+Attention size:   2.3MB per token
+```
+
+**Large context (1765 tokens):**
+```
+Wall clock:       47.0s (77.9ms/token)
+Token gaps:       43.0s (71.2ms/token)
+Our processing:   3840ms (6.36ms/token)
+Attention size:   7.7MB per token
+```
+
+### 📁 Files Modified
+
+**Core Changes:**
+- `js/conversation.js` - Recency bias fix (skip current turn scoring), brightness_at_deletion
+- `js/app.js` - Changed to 127.0.0.1, removed debug delays
+- `js/kobold_client.js` - Cleaned up WebSocket close handling
+- `index.html` - Max tokens slider increased to 2048
+
+**Git Cleanup:**
+- Deleted: `js/attention_tracker.js`, `js/conversation_state.js`, `js/heatmap.js`
+- Committed: `index.html`, `css/style.css`, `save_server.py`, test framework
+
+### 🎯 Next Session: Optimization
+
+**Performance investigation needed:**
+- Token gaps increased from 21ms to 72ms with larger context
+- KoboldCPP generates in 12s, but wall clock is 47s
+- 35 seconds unaccounted for - likely WebSocket transfer overhead
+- Need to profile binary frame handling
+
+**Potential optimizations:**
+1. Batch attention updates (every N tokens instead of every token)
+2. Reduce attention tensor size (top-K values only?)
+3. Web Workers for attention processing
+4. Connection pooling / keep-alive improvements
+
+---
+
 **Last Updated:** 2025-12-05
-**Status:** ✅ **PRODUCTION READY** - Real-time attention visualization at 37 tokens/second
-**Achievement:** 7.3x performance improvement (80s → 11s) via binary WebSocket streaming
+**Status:** ✅ **WORKING** - Multi-turn conversations with recency bias fix
+**Browser Support:** Chrome/Brave ✅ | Firefox ⚠️ (connection issues)
