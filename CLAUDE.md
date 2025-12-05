@@ -1285,6 +1285,94 @@ Total per token:    ~8ms (~125 tokens/sec)
 
 ---
 
-**Last Updated:** 2025-12-04
-**Status:** ✅ Production algorithm validated, ready for frontend integration
-**Next:** Port v3 to JavaScript, test live generation path
+## Session Summary (2025-12-04 Evening)
+
+### ✅ COMPLETED
+
+1. **WebSocket Binary Streaming - MASSIVE PERFORMANCE WIN**
+   - Implemented binary WebSocket endpoint in KoboldCPP (`/api/extra/generate/stream/ws`)
+   - Updated `kobold_client.js` with `_generateStreamWS()` method
+   - Zero-copy attention: `new Float32Array(event.data)` directly on binary frame
+   - **Result: 80s → 11s wall clock (7.3x faster)**
+
+2. **Performance Bottleneck Analysis**
+   - Added detailed timing instrumentation to identify bottlenecks
+   - Discovered SSE+base64 overhead was **64 seconds** per 512 tokens:
+     - Buffer string operations: 37.6s (73.5ms/token)
+     - JSON parsing: 5.5s (10.9ms/token)
+     - Base64 decode: 21.0s (41.0ms/token)
+   - Binary WebSocket eliminates ALL of this overhead
+
+3. **Data Capture Queue Fix**
+   - Fixed dropped tokens during capture (was losing ~95% of attention files)
+   - Root cause: `await` in SSE callback getting orphaned as tokens piled up
+   - Solution: Write queue with buffer copy, fire-and-forget from main loop
+   - Now captures 100% of tokens reliably
+
+4. **UI Rendering Optimizations**
+   - Added `tokenElements` Map for O(1) DOM lookups (was O(n) querySelector)
+   - Optimized `updateColors` to skip unchanged tokens
+   - Coalesced updates with `requestAnimationFrame`
+   - Changed paragraph detection from sentence punctuation to newlines
+
+### 📊 Performance Results
+
+**Before (SSE + Base64):**
+```
+Wall clock:       80.5s (157.3ms/token)
+Token gaps:       78.0s (152.3ms/token) [serialization overhead!]
+Our processing:   3.1s (6.1ms/token)
+Tokens/sec:       6.4
+```
+
+**After (WebSocket Binary):**
+```
+Wall clock:       11.0s (26.6ms/token)
+Token gaps:       8.8s (21.2ms/token) [actual model inference]
+Our processing:   2.2s (5.3ms/token)
+Tokens/sec:       37.6
+```
+
+**Breakdown of eliminated overhead:**
+| Component | Before | After | Savings |
+|-----------|--------|-------|---------|
+| Buffer ops | 37.6s | 0s | 100% |
+| JSON parse | 5.5s | 0.1s | 98% |
+| Base64 decode | 21.0s | 0s | 100% |
+| **Total** | **64.1s** | **<1s** | **99%** |
+
+### 🔑 Key Insight
+
+The model generates at ~50 tokens/sec. With SSE+base64, we were seeing 6.4 tokens/sec in the UI. The 64 seconds of serialization overhead was hiding the model's true performance.
+
+With binary WebSocket, the UI now keeps up with the model. **Real-time attention visualization at 37 tokens/second.**
+
+### 📁 Files Modified
+
+**KoboldCPP (separate repo):**
+- Added WebSocket endpoint `/api/extra/generate/stream/ws`
+- Binary frames for attention data (no base64)
+- Text frames for token metadata (tiny JSON)
+
+**Halo Weave:**
+- `js/kobold_client.js` - Added `_generateStreamWS()`, auto-fallback to SSE
+- `js/app.js` - Timing instrumentation, fire-and-forget capture
+- `js/data_capture.js` - Write queue with buffer copy
+- `js/conversation.js` - Paragraph detection by newlines
+- `js/renderer.js` - O(1) DOM lookups, update coalescing
+- `KOBOLD_API_SPEC.md` - Updated with Phase 6 WebSocket docs
+
+### 🎯 Current State
+
+**Performance:** ✅ Real-time (37 tok/s)
+**Data Capture:** ✅ 100% reliable
+**UI Visualization:** ✅ Smooth, responsive
+**WebSocket:** ✅ Primary transport (SSE fallback)
+
+The attention pipeline is now production-ready. Model inference is the only bottleneck.
+
+---
+
+**Last Updated:** 2025-12-05
+**Status:** ✅ **PRODUCTION READY** - Real-time attention visualization at 37 tokens/second
+**Achievement:** 7.3x performance improvement (80s → 11s) via binary WebSocket streaming

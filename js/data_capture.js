@@ -3,6 +3,15 @@
  *
  * Writes attention data incrementally to disk as tokens generate.
  * No memory accumulation - each token written immediately.
+ * 
+ * File format (per token):
+ *   token_XXXXX_meta.json  - Small metadata (~200 bytes)
+ *   token_XXXXX_attn.bin   - Raw Float32 attention tensor (~1.5MB)
+ * 
+ * Binary format eliminates JSON serialization bottleneck.
+ * Analysis scripts use: np.fromfile('token_00000_attn.bin', dtype=np.float32)
+ * 
+ * TODO: Consider Web Workers if UI still stutters during capture.
  */
 
 const CAPTURE_SERVER = 'http://127.0.0.1:8081';
@@ -13,6 +22,30 @@ export class DataCapture {
         this.captureTimestamp = null;
         this.captureDir = null;
         this.tokenCount = 0;
+        this._writeQueue = [];
+        this._isProcessingQueue = false;
+    }
+
+    /**
+     * Check if capture server is reachable
+     * @returns {Promise<boolean>} True if server responds
+     */
+    async isServerAvailable() {
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 2000);
+            
+            const response = await fetch(`${CAPTURE_SERVER}/capture?action=ping`, {
+                method: 'POST',
+                signal: controller.signal
+            });
+            
+            clearTimeout(timeout);
+            // Server returns 400 for unknown action, but that means it's alive
+            return response.status === 400 || response.ok;
+        } catch (err) {
+            return false;
+        }
     }
 
     /**
@@ -103,7 +136,7 @@ export class DataCapture {
 
     /**
      * Record a generated token with its full attention tensor
-     * Writes immediately to disk - no memory accumulation
+     * Queues writes to prevent overwhelming the server
      * @param {Object} token - Token object
      * @param {Object} attention - Full attention tensor from KoboldCPP
      * @param {number} generationStep - Which token in generation (0-indexed)
@@ -111,57 +144,100 @@ export class DataCapture {
     async recordGeneratedToken(token, attention, generationStep) {
         if (!this.isCapturing) return;
 
-        const tokenData = {
-            step: generationStep,
-            token_id: token.token_id,
-            text: token.text,
-            position: token.position,
-            timestamp: Date.now(),
-            attention: null
-        };
+        // Queue the write job (don't block)
+        this._writeQueue.push({
+            generationStep,
+            tokenMeta: {
+                step: generationStep,
+                token_id: token.token_id,
+                text: token.text,
+                position: token.position,
+                timestamp: Date.now(),
+                attention_shape: attention ? attention.shape : null,
+                attention_context_length: attention ? attention.contextLength : null
+            },
+            attentionBuffer: attention?.data?.buffer ? 
+                attention.data.buffer.slice(0) : null  // Copy buffer before it gets reused
+        });
 
-        // Include full attention tensor if available
-        if (attention) {
-            tokenData.attention = {
-                shape: attention.shape,
-                context_length: attention.contextLength,
-                // Convert Float32Array to regular array for JSON serialization
-                data: Array.from(attention.data)
-            };
+        // Start processing queue if not already running
+        this._processQueue();
+    }
+
+    /**
+     * Process write queue sequentially
+     */
+    async _processQueue() {
+        if (this._isProcessingQueue) return;
+        this._isProcessingQueue = true;
+
+        while (this._writeQueue.length > 0) {
+            const job = this._writeQueue.shift();
+            await this._writeToken(job);
         }
 
+        this._isProcessingQueue = false;
+    }
+
+    /**
+     * Actually write a token to disk
+     */
+    async _writeToken(job) {
+        const { generationStep, tokenMeta, attentionBuffer } = job;
+
         try {
-            // Write token file immediately
-            const response = await fetch(
-                `${CAPTURE_SERVER}/capture?action=write_token&ts=${this.captureTimestamp}&index=${generationStep}`,
+            // Write metadata JSON (tiny, fast)
+            const metaResponse = await fetch(
+                `${CAPTURE_SERVER}/capture?action=write_token_meta&ts=${this.captureTimestamp}&index=${generationStep}`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(tokenData)
+                    body: JSON.stringify(tokenMeta)
                 }
             );
 
-            if (!response.ok) {
-                console.warn(`⚠️  Failed to write token ${generationStep}: ${response.statusText}`);
+            if (!metaResponse.ok) {
+                console.warn(`⚠️  Failed to write token meta ${generationStep}: ${metaResponse.statusText}`);
+            }
+
+            // Write attention binary
+            if (attentionBuffer) {
+                const binResponse = await fetch(
+                    `${CAPTURE_SERVER}/capture?action=write_token_attn&ts=${this.captureTimestamp}&index=${generationStep}`,
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/octet-stream' },
+                        body: attentionBuffer
+                    }
+                );
+
+                if (!binResponse.ok) {
+                    console.warn(`⚠️  Failed to write attention ${generationStep}: ${binResponse.statusText}`);
+                }
             }
 
             this.tokenCount++;
 
         } catch (err) {
             console.warn(`⚠️  Error writing token ${generationStep}:`, err);
-            // Don't stop capture, just log error
         }
     }
 
     /**
-     * Stop capture
-     * Data is already on disk, so just update status
+     * Stop capture and export conversation state snapshot
+     * Data is already on disk, this adds the final state export
+     * @param {Object} conversationState - Full conversation state to export
      * @returns {Object} Capture summary
      */
-    stopCapture() {
+    async stopCapture(conversationState = null) {
         if (!this.isCapturing) {
             console.warn('No active capture session');
             return null;
+        }
+
+        // Export conversation state snapshot to capture folder
+        if (conversationState) {
+            await this._writeStateSnapshot(conversationState);
         }
 
         this.isCapturing = false;
@@ -174,6 +250,36 @@ export class DataCapture {
         console.log(`✅ Capture complete: ${this.tokenCount} tokens written to ${this.captureDir}`);
 
         return summary;
+    }
+
+    /**
+     * Write conversation state snapshot to capture directory
+     * @param {Object} state - Conversation state from exportState()
+     */
+    async _writeStateSnapshot(state) {
+        if (!this.captureTimestamp) return;
+
+        console.log('📸 Writing conversation state snapshot...');
+
+        try {
+            const response = await fetch(
+                `${CAPTURE_SERVER}/capture?action=write_state&ts=${this.captureTimestamp}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(state)
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error(`Failed to write state: ${response.statusText}`);
+            }
+
+            console.log('✅ State snapshot written');
+
+        } catch (err) {
+            console.error('❌ Failed to write state snapshot:', err);
+        }
     }
 
     /**

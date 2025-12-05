@@ -1,448 +1,470 @@
 /**
- * App - Main Application Controller
- *
- * Coordinates all components:
- * - KoboldClient for API communication
- * - ConversationState for token management
- * - AttentionTracker for attention processing
- * - Heatmap for visualization
+ * Halo Weave - Main Application Controller
+ * 
+ * Coordinates:
+ * - KoboldClient for model communication
+ * - Conversation for token storage + brightness scoring
+ * - Renderer for grayscale visualization
+ * - DataCapture for attention recording
  */
 
 import { KoboldClient } from './kobold_client.js';
-import { ConversationState } from './conversation_state.js';
-import { AttentionTracker } from './attention_tracker.js';
-import { Heatmap } from './heatmap.js';
+import { Conversation } from './conversation.js';
+import { Renderer } from './renderer.js';
 import { DataCapture } from './data_capture.js';
 
 class App {
     constructor() {
         // Core components
         this.client = new KoboldClient('http://localhost:5001');
-        this.conversation = new ConversationState();
-        this.tracker = new AttentionTracker();
-        this.heatmap = new Heatmap(document.getElementById('heatmap'));
-        this.dataCapture = new DataCapture();
-
-        // UI elements
-        this.userInput = document.getElementById('user-input');
-        this.sendButton = document.getElementById('send-button');
-        this.clearButton = document.getElementById('clear-button');
-        this.statusElement = document.getElementById('status');
-        this.statsElement = document.getElementById('stats');
-
+        this.conversation = new Conversation();
+        this.renderer = new Renderer(document.getElementById('tokens'));
+        this.capture = new DataCapture();
+        
         // State
         this.isGenerating = false;
-        this.modelInfo = null;
-        this.config = this._loadConfig();
-
-        // Bind event handlers
-        this._bindEvents();
-    }
-
-    /**
-     * Initialize the application
-     */
-    async initialize() {
-        this._updateStatus('Connecting to KoboldCPP...', 'info');
-
-        try {
-            // Check if server is reachable
-            const reachable = await this.client.ping();
-            if (!reachable) {
-                throw new Error('KoboldCPP server not reachable at http://localhost:5001');
-            }
-
-            // Get model info
-            this.modelInfo = await this.client.getModelInfo();
-            this._updateStatus(`Connected: ${this.modelInfo.model_name}`, 'success');
-
-            // Update tracker config with model info if needed
-            this._updateTrackerFromUI();
-
-            // Add system message
-            await this._addSystemMessage();
-
-        } catch (err) {
-            this._updateStatus(`Error: ${err.message}`, 'error');
-            console.error('Initialization error:', err);
-        }
-    }
-
-    /**
-     * Send user message and generate response
-     */
-    async sendMessage() {
-        const text = this.userInput.value.trim();
-        if (!text || this.isGenerating) return;
-
-        this.isGenerating = true;
-        this.sendButton.disabled = true;
-        this.userInput.disabled = true;
-
-        try {
-            // Tokenize user message with ChatML format
-            this._updateStatus('Tokenizing...', 'info');
-            const formattedText = `<|im_start|>user\n${text}<|im_end|>\n`;
-            const tokens = await this.client.tokenize(formattedText);
-
-            // Add to conversation
-            this.heatmap.startTurn(this.conversation.currentTurnId, 'user');
-            const startIndex = this.conversation.tokens.length;
-            this.conversation.addMessage('user', tokens);
-            const endIndex = this.conversation.tokens.length;
-            for (let i = startIndex; i < endIndex; i++) {
-                this.heatmap.addToken(this.conversation.tokens[i]);
-            }
-            this.conversation.nextTurn();
-
-            // Clear input
-            this.userInput.value = '';
-
-            // Generate response
-            this._updateStatus('Generating...', 'info');
-            await this._generateResponse();
-
-        } catch (err) {
-            this._updateStatus(`Error: ${err.message}`, 'error');
-            console.error('Send message error:', err);
-        } finally {
-            this.isGenerating = false;
-            this.sendButton.disabled = false;
-            this.userInput.disabled = false;
-            this.userInput.focus();
-        }
-    }
-
-    /**
-     * Generate assistant response
-     */
-    async _generateResponse() {
-        // Start new turn for assistant
-        this.heatmap.startTurn(this.conversation.currentTurnId, 'Qwen');
-
-        // Add assistant start token
-        const assistantStart = await this.client.tokenize('<|im_start|>assistant\n');
-        const startIndex = this.conversation.tokens.length;
-        this.conversation.addMessage('Qwen', assistantStart);
-        const endIndex = this.conversation.tokens.length;
-        for (let i = startIndex; i < endIndex; i++) {
-            this.heatmap.addToken(this.conversation.tokens[i]);
-        }
-
-        // Get input IDs
-        const inputIds = this.conversation.getInputIds();
-        const indexToPosition = this.conversation.buildIndexToPositionMap();
-
-        // Build generation config
-        const config = {
-            maxNewTokens: parseInt(document.getElementById('max-length').value) || 50,
-            temperature: parseFloat(document.getElementById('temperature').value) || 0.7,
-            topP: parseFloat(document.getElementById('top-p').value) || 0.9,
-            returnAttention: true,
-            bannedTokens: this.modelInfo?.special_tokens?.im_start_id ?
-                [this.modelInfo.special_tokens.im_start_id] : []
+        this.generationStep = 0;
+        this.totalPruned = 0;
+        
+        // DOM elements
+        this.elements = {
+            status: document.getElementById('status'),
+            systemPrompt: document.getElementById('system-prompt'),
+            maxTokens: document.getElementById('max-tokens'),
+            maxTokensVal: document.getElementById('max-tokens-val'),
+            temperature: document.getElementById('temperature'),
+            temperatureVal: document.getElementById('temperature-val'),
+            topP: document.getElementById('top-p'),
+            topPVal: document.getElementById('top-p-val'),
+            maxContext: document.getElementById('max-context'),
+            userInput: document.getElementById('user-input'),
+            btnSend: document.getElementById('btn-send'),
+            btnClear: document.getElementById('btn-clear'),
+            btnExport: document.getElementById('btn-export'),
+            btnStartCapture: document.getElementById('btn-start-capture'),
+            btnStopCapture: document.getElementById('btn-stop-capture'),
+            captureStatus: document.getElementById('capture-status'),
+            statTokens: document.getElementById('stat-tokens'),
+            statBrightness: document.getElementById('stat-brightness'),
+            statPruned: document.getElementById('stat-pruned')
         };
-
-        let tokenCount = 0;
-
-        // If capturing, record prompt tokens
-        if (this.dataCapture.isCapturing) {
-            this.dataCapture.recordPromptTokens(this.conversation.getActiveTokens());
-        }
-
-        // Stream generation
-        await this.client.generateStream(
-            inputIds,
-            config,
-            // onToken callback
-            (tokenId, text, attention) => {
-                // Add token to conversation
-                this.conversation.addToken(tokenId, text);
-                const newToken = this.conversation.tokens[this.conversation.tokens.length - 1];
-
-                // Capture full attention data if recording
-                if (this.dataCapture.isCapturing && attention) {
-                    this.dataCapture.recordGeneratedToken(newToken, attention, tokenCount);
-                }
-
-                // Update attention if available
-                if (attention) {
-                    this.tracker.updateAttention(
-                        attention,
-                        newToken.position,
-                        this.conversation
-                    );
-                }
-
-                // Render token
-                this.heatmap.addToken(newToken);
-
-                // Update all token colors
-                this.heatmap.updateAll(this.conversation);
-
-                tokenCount++;
-                this._updateStatus(`Generated ${tokenCount} tokens...`, 'info');
-                this._updateStats();
-            },
-            // onDone callback
-            (data) => {
-                this._updateStatus(`Generation complete (${tokenCount} tokens)`, 'success');
-                this.conversation.nextTurn();
-                this.tracker.reset();
-
-                // Check if pruning needed
-                this._checkPruning();
-
-                this.heatmap.scrollToBottom();
-            },
-            // onError callback
-            (err) => {
-                this._updateStatus(`Generation error: ${err.message}`, 'error');
-                console.error('Generation error:', err);
-            }
-        );
+        
+        this._bindEvents();
+        this._init();
     }
 
-    /**
-     * Check if pruning is needed and execute
-     */
-    _checkPruning() {
-        const maxTokens = parseInt(document.getElementById('max-context-tokens').value);
-        if (!maxTokens || maxTokens === 0) return;
-
-        const stats = this.conversation.getStats();
-        if (stats.active_tokens <= maxTokens) return;
-
-        // Prune sentences until under threshold
-        let iterations = 0;
-        const maxIterations = 100;
-
-        while (this.conversation.getStats().active_tokens > maxTokens && iterations < maxIterations) {
-            const sentences = this.conversation.getSentences();
-            const activeSentences = sentences.filter(s => !s.fully_deleted);
-
-            if (activeSentences.length === 0) break;
-
-            // Find dimmest sentence
-            const dimmest = activeSentences.reduce((min, s) =>
-                s.max_brightness < min.max_brightness ? s : min
-            );
-
-            // Prune it
-            const pruned = this.conversation.pruneSentence(
-                dimmest.turn_id,
-                dimmest.sentence_id,
-                dimmest.message_role
-            );
-
-            // Animate pruning
-            this.heatmap.animatePruning(
-                dimmest.turn_id,
-                dimmest.sentence_id,
-                dimmest.message_role
-            );
-
-            console.log(`Pruned sentence (turn ${dimmest.turn_id}, sentence ${dimmest.sentence_id}): ${pruned} tokens, brightness ${dimmest.max_brightness.toFixed(4)}`);
-
-            iterations++;
+    async _init() {
+        this._setStatus('Connecting...', '');
+        
+        try {
+            const modelInfo = await this.client.getModelInfo();
+            this._setStatus(`Connected: ${modelInfo.model_name || 'Unknown Model'}`, 'connected');
+            console.log('Model info:', modelInfo);
+        } catch (err) {
+            this._setStatus('Connection failed - is KoboldCPP running?', 'error');
+            console.error('Connection error:', err);
         }
-
-        if (iterations > 0) {
-            this._updateStatus(`Pruned ${iterations} sentences`, 'info');
-            this._updateStats();
-        }
-    }
-
-    /**
-     * Add system message to conversation
-     */
-    async _addSystemMessage() {
-        const systemPrompt = document.getElementById('system-prompt').value;
-
-        // Format with ChatML tokens: <|im_start|>system\n{prompt}<|im_end|>\n
-        const formattedPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n`;
-        const tokens = await this.client.tokenize(formattedPrompt);
-
-        this.heatmap.startTurn(this.conversation.currentTurnId, 'system');
-        const startIndex = this.conversation.tokens.length;
-        this.conversation.addMessage('system', tokens);
-        const endIndex = this.conversation.tokens.length;
-        for (let i = startIndex; i < endIndex; i++) {
-            this.heatmap.addToken(this.conversation.tokens[i]);
-        }
-        this.conversation.nextTurn();
-    }
-
-    /**
-     * Clear conversation
-     */
-    async clearConversation() {
-        if (this.isGenerating) return;
-
-        this.conversation.clear();
-        this.tracker.reset();
-        this.heatmap.clear();
-
-        await this._addSystemMessage();
-
-        this._updateStatus('Conversation cleared', 'info');
+        
+        this._loadSettings();
         this._updateStats();
     }
 
-    /**
-     * Update status message
-     */
-    _updateStatus(message, type = 'info') {
-        this.statusElement.textContent = message;
-        this.statusElement.className = `status ${type}`;
-    }
-
-    /**
-     * Update statistics display
-     */
-    _updateStats() {
-        const stats = this.heatmap.getStats(this.conversation);
-        this.statsElement.innerHTML = `
-            <div>Total: ${stats.total_tokens} | Active: ${stats.active_tokens} | Deleted: ${stats.deleted_tokens}</div>
-            <div>Turns: ${stats.turns} | Avg Brightness: ${(stats.avgBrightness * 100).toFixed(1)}%</div>
-            <div>Min: ${(stats.minBrightness * 100).toFixed(1)}% | Max: ${(stats.maxBrightness * 100).toFixed(1)}%</div>
-        `;
-    }
-
-    /**
-     * Update tracker configuration from UI
-     */
-    _updateTrackerFromUI() {
-        this.tracker.updateConfig({
-            aggregationMode: document.getElementById('aggregation-mode').value,
-            decayMode: document.getElementById('decay-mode').value,
-            decayRate: parseFloat(document.getElementById('decay-rate').value),
-            distanceWeightMode: document.getElementById('distance-mode').value,
-            minDistance: parseInt(document.getElementById('min-distance').value),
-            distanceScale: parseFloat(document.getElementById('distance-scale').value),
-            boostMultiplier: parseFloat(document.getElementById('boost-multiplier').value)
-        });
-    }
-
-    /**
-     * Bind UI event handlers
-     */
     _bindEvents() {
-        // Send message
-        this.sendButton.addEventListener('click', () => this.sendMessage());
-        this.userInput.addEventListener('keypress', (e) => {
+        // Slider value displays
+        this.elements.maxTokens.addEventListener('input', (e) => {
+            this.elements.maxTokensVal.textContent = e.target.value;
+        });
+        this.elements.temperature.addEventListener('input', (e) => {
+            this.elements.temperatureVal.textContent = e.target.value;
+        });
+        this.elements.topP.addEventListener('input', (e) => {
+            this.elements.topPVal.textContent = e.target.value;
+        });
+        
+        // Send button
+        this.elements.btnSend.addEventListener('click', () => this._handleSend());
+        
+        // Enter to send (Shift+Enter for newline)
+        this.elements.userInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
-                this.sendMessage();
+                this._handleSend();
             }
         });
-
-        // Clear conversation
-        this.clearButton.addEventListener('click', () => this.clearConversation());
-
-        // Settings changes
-        document.querySelectorAll('input, select').forEach(el => {
-            el.addEventListener('change', () => {
-                this._updateTrackerFromUI();
-                this._saveConfig();
-            });
-        });
-
-        // Export data
-        document.getElementById('export-button')?.addEventListener('click', () => {
-            const data = this.conversation.exportState();
-            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `halo_weave_${Date.now()}.json`;
-            a.click();
-        });
-
-        // Data capture buttons
-        document.getElementById('start-capture-button')?.addEventListener('click', async () => {
-            const status = document.getElementById('capture-status');
-            const startBtn = document.getElementById('start-capture-button');
-            const stopBtn = document.getElementById('stop-capture-button');
-
-            status.textContent = '🎬 Starting capture...';
-            startBtn.disabled = true;
-
-            try {
-                await this.dataCapture.startCapture({
-                    model: this.modelInfo?.model_name || 'unknown',
-                    description: 'Attention pattern analysis experiment',
-                    config: {
-                        max_length: parseInt(document.getElementById('max-length').value),
-                        temperature: parseFloat(document.getElementById('temperature').value),
-                        top_p: parseFloat(document.getElementById('top-p').value)
-                    }
-                });
-
-                startBtn.style.display = 'none';
-                stopBtn.style.display = 'block';
-                startBtn.disabled = false;
-                status.textContent = '🔴 Recording to disk...';
-            } catch (err) {
-                status.textContent = `❌ Failed to start: ${err.message}`;
-                startBtn.disabled = false;
-                console.error('Capture start error:', err);
-            }
-        });
-
-        document.getElementById('stop-capture-button')?.addEventListener('click', () => {
-            const summary = this.dataCapture.stopCapture();
-            const status = document.getElementById('capture-status');
-            const startBtn = document.getElementById('start-capture-button');
-            const stopBtn = document.getElementById('stop-capture-button');
-
-            stopBtn.style.display = 'none';
-            startBtn.style.display = 'block';
-
-            if (summary) {
-                status.textContent = `✅ Saved ${summary.tokens_captured} tokens to ${summary.capture_dir}`;
-            }
+        
+        // Clear button
+        this.elements.btnClear.addEventListener('click', () => this._handleClear());
+        
+        // Export button
+        this.elements.btnExport.addEventListener('click', () => this._handleExport());
+        
+        // Capture buttons
+        this.elements.btnStartCapture.addEventListener('click', () => this._handleStartCapture());
+        this.elements.btnStopCapture.addEventListener('click', () => this._handleStopCapture());
+        
+        // Check capture server availability on load
+        this._checkCaptureServer();
+        
+        // Save settings on change
+        ['maxTokens', 'temperature', 'topP', 'maxContext', 'systemPrompt'].forEach(key => {
+            this.elements[key].addEventListener('change', () => this._saveSettings());
         });
     }
 
-    /**
-     * Load configuration from localStorage
-     */
-    _loadConfig() {
-        const saved = localStorage.getItem('halo_weave_config');
-        if (saved) {
-            try {
-                const config = JSON.parse(saved);
-                // Apply to UI
-                Object.keys(config).forEach(key => {
-                    const el = document.getElementById(key);
-                    if (el) el.value = config[key];
-                });
-                return config;
-            } catch (err) {
-                console.warn('Failed to load config:', err);
+    async _handleSend() {
+        const text = this.elements.userInput.value.trim();
+        if (!text || this.isGenerating) return;
+        
+        this.elements.userInput.value = '';
+        this.isGenerating = true;
+        this.elements.btnSend.disabled = true;
+        
+        try {
+            // Add system prompt if this is the first message
+            if (this.conversation.tokens.length === 0) {
+                const systemPrompt = this.elements.systemPrompt.value.trim();
+                if (systemPrompt) {
+                    await this._addMessage('system', systemPrompt);
+                }
             }
+            
+            // Add user message
+            await this._addMessage('user', text);
+            
+            // Generate response
+            await this._generate();
+            
+            // End assistant turn
+            this.conversation.nextTurn();
+            
+        } catch (err) {
+            console.error('Generation error:', err);
+            this._setStatus('Generation failed: ' + err.message, 'error');
+        } finally {
+            this.isGenerating = false;
+            this.elements.btnSend.disabled = false;
         }
-        return {};
     }
 
-    /**
-     * Save configuration to localStorage
-     */
-    _saveConfig() {
-        const config = {};
-        document.querySelectorAll('input[id], select[id]').forEach(el => {
-            config[el.id] = el.value;
+    async _addMessage(role, text) {
+        // Format with ChatML
+        const formatted = role === 'system' 
+            ? `<|im_start|>system\n${text}<|im_end|>\n`
+            : role === 'user'
+            ? `<|im_start|>user\n${text}<|im_end|>\n`
+            : text;
+        
+        // Tokenize
+        const tokens = await this.client.tokenize(formatted);
+        
+        // Add to conversation
+        this.conversation.addMessage(role, tokens);
+        this.conversation.nextTurn();
+        
+        // Record prompt tokens if capturing
+        if (this.capture.isCapturing && role !== 'assistant') {
+            await this.capture.recordPromptTokens(this.conversation.tokens);
+        }
+        
+        // Render
+        this.renderer.rebuild(this.conversation);
+        this._updateStats();
+    }
+
+    async _generate() {
+        // Start assistant turn
+        this.conversation.currentRole = 'assistant';
+        this.conversation.currentSentenceId = 0;
+        
+        // Add assistant prefix
+        const prefix = '<|im_start|>assistant\n';
+        const prefixTokens = await this.client.tokenize(prefix);
+        for (const t of prefixTokens) {
+            const token = this.conversation.addStreamingToken(t.token_id, t.text);
+            this.renderer.addToken(token, this.conversation);
+        }
+        
+        // Build prompt from active tokens
+        const inputIds = this.conversation.getInputIds();
+        
+        // Generation config
+        const config = {
+            maxNewTokens: parseInt(this.elements.maxTokens.value),
+            temperature: parseFloat(this.elements.temperature.value),
+            topP: parseFloat(this.elements.topP.value),
+            returnAttention: true
+        };
+        
+        this.generationStep = 0;
+        
+        // Timing stats
+        this._timingStats = {
+            addToken: 0,
+            updateBrightness: 0,
+            updateColors: 0,
+            renderToken: 0,
+            capture: 0,
+            pruning: 0,
+            stats: 0,
+            total: 0,
+            count: 0,
+            lastTokenTime: performance.now(),
+            tokenGaps: 0,  // Time between tokens (network + model)
+            startTime: performance.now(),
+            attentionSize: 0  // Track attention data size
+        };
+        
+        // Stream generation - callback signature: (tokenId, text, attention)
+        await new Promise((resolve, reject) => {
+            this.client.generateStream(
+                inputIds,
+                config,
+                // onToken callback
+                async (tokenId, text, attention) => {
+                    const t0 = performance.now();
+                    
+                    // Measure gap since last token (network + model inference)
+                    this._timingStats.tokenGaps += t0 - this._timingStats.lastTokenTime;
+                    
+                    // Skip if no valid token
+                    if (tokenId === null && !text) return;
+                    
+                    // Add token to conversation
+                    let t1 = performance.now();
+                    const token = this.conversation.addStreamingToken(
+                        tokenId,
+                        text
+                    );
+                    this._timingStats.addToken += performance.now() - t1;
+                    
+                    // Update brightness if we have attention data
+                    if (attention) {
+                        this._timingStats.attentionSize = attention.data.length * 4;  // bytes
+                        
+                        t1 = performance.now();
+                        this.conversation.updateBrightness(attention);
+                        this._timingStats.updateBrightness += performance.now() - t1;
+                        
+                        t1 = performance.now();
+                        this.renderer.updateColors(this.conversation);
+                        this._timingStats.updateColors += performance.now() - t1;
+                        
+                        // Record if capturing (fire-and-forget to not block token stream)
+                        if (this.capture.isCapturing) {
+                            t1 = performance.now();
+                            // Don't await - let writes happen in background
+                            this.capture.recordGeneratedToken(
+                                token,
+                                attention,
+                                this.generationStep
+                            ).catch(err => console.warn('Capture error:', err));
+                            this._timingStats.capture += performance.now() - t1;
+                        }
+                    }
+                    
+                    // Render new token
+                    t1 = performance.now();
+                    this.renderer.addToken(token, this.conversation);
+                    this._timingStats.renderToken += performance.now() - t1;
+                    
+                    // Check pruning budget
+                    t1 = performance.now();
+                    this._checkPruning();
+                    this._timingStats.pruning += performance.now() - t1;
+                    
+                    t1 = performance.now();
+                    this._updateStats();
+                    this._timingStats.stats += performance.now() - t1;
+                    
+                    this._timingStats.total += performance.now() - t0;
+                    this._timingStats.count++;
+                    this._timingStats.lastTokenTime = performance.now();
+                    this.generationStep++;
+                },
+                // onDone callback
+                (data) => {
+                    console.log('Generation complete:', data);
+                    
+                    // Print timing report
+                    const s = this._timingStats;
+                    const n = s.count || 1;
+                    const wallClock = performance.now() - s.startTime;
+                    console.log(`\n⏱️ TIMING REPORT (${n} tokens)`);
+                    console.log(`   Wall clock:       ${(wallClock/1000).toFixed(1)}s (${(wallClock/n).toFixed(1)}ms/token)`);
+                    console.log(`   Token gaps:       ${(s.tokenGaps/1000).toFixed(1)}s (${(s.tokenGaps/n).toFixed(1)}ms/token) [network+model+decode]`);
+                    console.log(`   Our processing:   ${s.total.toFixed(0)}ms (${(s.total/n).toFixed(2)}ms/token)`);
+                    console.log(`   ├─ addToken:      ${s.addToken.toFixed(1)}ms (${(s.addToken/n).toFixed(2)}ms/token)`);
+                    console.log(`   ├─ updateBright:  ${s.updateBrightness.toFixed(1)}ms (${(s.updateBrightness/n).toFixed(2)}ms/token)`);
+                    console.log(`   ├─ updateColors:  ${s.updateColors.toFixed(1)}ms (${(s.updateColors/n).toFixed(2)}ms/token)`);
+                    console.log(`   ├─ renderToken:   ${s.renderToken.toFixed(1)}ms (${(s.renderToken/n).toFixed(2)}ms/token)`);
+                    console.log(`   ├─ pruning:       ${s.pruning.toFixed(1)}ms (${(s.pruning/n).toFixed(2)}ms/token)`);
+                    console.log(`   ├─ stats:         ${s.stats.toFixed(1)}ms (${(s.stats/n).toFixed(2)}ms/token)`);
+                    console.log(`   └─ capture:       ${s.capture.toFixed(1)}ms (${(s.capture/n).toFixed(2)}ms/token)`);
+                    console.log(`   Unaccounted:      ${(wallClock - s.tokenGaps - s.total).toFixed(0)}ms [browser paint/layout]`);
+                    console.log(`   Attention size:   ${(s.attentionSize / 1024 / 1024).toFixed(1)}MB per token`);
+                    
+                    resolve();
+                },
+                // onError callback
+                (error) => {
+                    console.error('Generation error:', error);
+                    reject(error);
+                }
+            );
         });
-        localStorage.setItem('halo_weave_config', JSON.stringify(config));
+        
+        // Add end token
+        const endTokens = await this.client.tokenize('<|im_end|>\n');
+        for (const t of endTokens) {
+            const token = this.conversation.addStreamingToken(t.token_id, t.text);
+            this.renderer.addToken(token, this.conversation);
+        }
+        
+        this._updateStats();
+    }
+
+    _checkPruning() {
+        const maxContext = parseInt(this.elements.maxContext.value);
+        if (maxContext <= 0) return;  // Pruning disabled
+        
+        const pruned = this.conversation.pruneToFit(maxContext);
+        if (pruned > 0) {
+            this.totalPruned += pruned;
+            this.renderer.rebuild(this.conversation);
+            console.log(`Pruned ${pruned} sentences to fit budget`);
+        }
+    }
+
+    _handleClear() {
+        if (this.isGenerating) return;
+        
+        this.conversation.clear();
+        this.renderer.clear();
+        this.totalPruned = 0;
+        this._updateStats();
+    }
+
+    _handleExport() {
+        const state = this.conversation.exportState();
+        const json = JSON.stringify(state, null, 2);
+        
+        // Download as file
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `halo_weave_export_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    async _checkCaptureServer() {
+        const available = await this.capture.isServerAvailable();
+        
+        if (available) {
+            this.elements.btnStartCapture.disabled = false;
+            this.elements.captureStatus.textContent = '';
+        } else {
+            this.elements.btnStartCapture.disabled = true;
+            this.elements.captureStatus.textContent = '⚠️ Capture server not running (port 8081)';
+        }
+    }
+
+    async _handleStartCapture() {
+        // Re-check server availability
+        const available = await this.capture.isServerAvailable();
+        if (!available) {
+            this.elements.captureStatus.textContent = '❌ Capture server not reachable';
+            return;
+        }
+        
+        try {
+            await this.capture.startCapture({
+                model: 'KoboldCPP',
+                config: {
+                    max_tokens: this.elements.maxTokens.value,
+                    temperature: this.elements.temperature.value,
+                    top_p: this.elements.topP.value
+                }
+            });
+            
+            this.elements.btnStartCapture.disabled = true;
+            this.elements.btnStopCapture.disabled = false;
+            this.elements.captureStatus.textContent = '🔴 Recording...';
+            
+        } catch (err) {
+            this.elements.captureStatus.textContent = '❌ Failed to start capture';
+            console.error('Capture start error:', err);
+        }
+    }
+
+    async _handleStopCapture() {
+        // Stop capture and write state snapshot
+        const state = this.conversation.exportState();
+        const summary = await this.capture.stopCapture(state);
+        
+        this.elements.btnStartCapture.disabled = false;
+        this.elements.btnStopCapture.disabled = true;
+        
+        if (summary) {
+            this.elements.captureStatus.textContent = 
+                `✅ Saved ${summary.tokens_captured} tokens`;
+        } else {
+            this.elements.captureStatus.textContent = '';
+        }
+    }
+
+    _updateStats() {
+        const stats = this.conversation.getStats();
+        this.elements.statTokens.textContent = stats.activeTokens;
+        this.elements.statBrightness.textContent = 
+            stats.activeTokens > 0 
+                ? `${stats.minBrightness} - ${stats.maxBrightness}` 
+                : '-';
+        this.elements.statPruned.textContent = this.totalPruned;
+    }
+
+    _setStatus(text, className) {
+        this.elements.status.textContent = text;
+        this.elements.status.className = 'status ' + (className || '');
+    }
+
+    _saveSettings() {
+        const settings = {
+            systemPrompt: this.elements.systemPrompt.value,
+            maxTokens: this.elements.maxTokens.value,
+            temperature: this.elements.temperature.value,
+            topP: this.elements.topP.value,
+            maxContext: this.elements.maxContext.value
+        };
+        localStorage.setItem('halo_weave_settings', JSON.stringify(settings));
+    }
+
+    _loadSettings() {
+        try {
+            const saved = localStorage.getItem('halo_weave_settings');
+            if (saved) {
+                const settings = JSON.parse(saved);
+                if (settings.systemPrompt) this.elements.systemPrompt.value = settings.systemPrompt;
+                if (settings.maxTokens) {
+                    this.elements.maxTokens.value = settings.maxTokens;
+                    this.elements.maxTokensVal.textContent = settings.maxTokens;
+                }
+                if (settings.temperature) {
+                    this.elements.temperature.value = settings.temperature;
+                    this.elements.temperatureVal.textContent = settings.temperature;
+                }
+                if (settings.topP) {
+                    this.elements.topP.value = settings.topP;
+                    this.elements.topPVal.textContent = settings.topP;
+                }
+                if (settings.maxContext) this.elements.maxContext.value = settings.maxContext;
+            }
+        } catch (err) {
+            console.warn('Failed to load settings:', err);
+        }
     }
 }
 
-// Initialize app when DOM is ready
-document.addEventListener('DOMContentLoaded', () => {
-    const app = new App();
-    app.initialize();
-
-    // Make app globally accessible for debugging
-    window.app = app;
-});
+// Initialize app
+window.app = new App();
