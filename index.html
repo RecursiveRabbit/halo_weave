@@ -3,148 +3,86 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Halo Weave - Attention Visualization</title>
+    <title>Halo Weave</title>
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-    <div class="container">
+    <div class="app">
         <!-- Header -->
-        <header>
-            <h1>🌀 Halo Weave</h1>
-            <p class="subtitle">Brightness-Based Context Pruning</p>
-            <div id="status" class="status info">Initializing...</div>
+        <header class="header">
+            <h1>Halo Weave</h1>
+            <div id="status" class="status">Connecting...</div>
         </header>
 
-        <!-- Main Content -->
-        <div class="main-content">
-            <!-- Settings Panel -->
-            <aside class="settings-panel">
-                <h2>Settings</h2>
+        <!-- Main Layout -->
+        <div class="main">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <section class="panel">
+                    <h2>System Prompt</h2>
+                    <textarea id="system-prompt" rows="4">You are a helpful AI assistant.</textarea>
+                </section>
 
-                <!-- System Prompt -->
-                <div class="setting-group">
-                    <label for="system-prompt">System Prompt</label>
-                    <textarea id="system-prompt" rows="3">You are Qwen, an AI participating in a research project on attention-based context management. You are helpful, harmless, and honest.</textarea>
-                </div>
+                <section class="panel">
+                    <h2>Generation</h2>
+                    <label>
+                        Max Tokens: <span id="max-tokens-val">50</span>
+                        <input type="range" id="max-tokens" min="10" max="512" value="50">
+                    </label>
+                    <label>
+                        Temperature: <span id="temperature-val">0.7</span>
+                        <input type="range" id="temperature" min="0.1" max="2.0" step="0.1" value="0.7">
+                    </label>
+                    <label>
+                        Top-P: <span id="top-p-val">0.9</span>
+                        <input type="range" id="top-p" min="0.0" max="1.0" step="0.05" value="0.9">
+                    </label>
+                </section>
 
-                <!-- Generation Settings -->
-                <div class="setting-group">
-                    <h3>Generation</h3>
+                <section class="panel">
+                    <h2>Context Budget</h2>
+                    <label>
+                        Max Context Tokens
+                        <input type="number" id="max-context" min="0" max="10000" step="100" value="2000">
+                    </label>
+                    <p class="hint">0 = no pruning</p>
+                </section>
 
-                    <label for="max-length">Max New Tokens: <span id="max-length-value">50</span></label>
-                    <input type="range" id="max-length" min="10" max="512" value="50"
-                           oninput="document.getElementById('max-length-value').textContent = this.value">
-
-                    <label for="temperature">Temperature: <span id="temperature-value">0.7</span></label>
-                    <input type="range" id="temperature" min="0.1" max="2.0" step="0.1" value="0.7"
-                           oninput="document.getElementById('temperature-value').textContent = this.value">
-
-                    <label for="top-p">Top-P: <span id="top-p-value">0.9</span></label>
-                    <input type="range" id="top-p" min="0.0" max="1.0" step="0.05" value="0.9"
-                           oninput="document.getElementById('top-p-value').textContent = this.value">
-                </div>
-
-                <!-- Attention Settings -->
-                <div class="setting-group">
-                    <h3>Attention</h3>
-
-                    <label for="aggregation-mode">Aggregation Mode</label>
-                    <select id="aggregation-mode">
-                        <option value="mean" selected>Mean</option>
-                        <option value="max">Max</option>
-                        <option value="last_layer">Last Layer</option>
-                        <option value="weighted_layers">Weighted Layers</option>
-                    </select>
-
-                    <label for="decay-mode">Decay Mode</label>
-                    <select id="decay-mode">
-                        <option value="additive" selected>Additive</option>
-                        <option value="none">None</option>
-                        <option value="exponential">Exponential</option>
-                    </select>
-
-                    <label for="decay-rate">Decay Rate: <span id="decay-rate-value">0.003</span></label>
-                    <input type="range" id="decay-rate" min="0.0001" max="0.01" step="0.0001" value="0.003"
-                           oninput="document.getElementById('decay-rate-value').textContent = this.value">
-
-                    <label for="boost-multiplier">Boost Multiplier: <span id="boost-multiplier-value">1.0</span></label>
-                    <input type="range" id="boost-multiplier" min="1" max="20" step="0.5" value="1.0"
-                           oninput="document.getElementById('boost-multiplier-value').textContent = this.value">
-                </div>
-
-                <!-- Distance Weighting -->
-                <div class="setting-group">
-                    <h3>Distance Weighting</h3>
-
-                    <label for="distance-mode">Mode</label>
-                    <select id="distance-mode">
-                        <option value="logarithmic" selected>Logarithmic</option>
-                        <option value="none">None</option>
-                        <option value="threshold">Threshold</option>
-                        <option value="linear">Linear</option>
-                        <option value="square_root">Square Root</option>
-                    </select>
-
-                    <label for="min-distance">Min Distance: <span id="min-distance-value">20</span></label>
-                    <input type="range" id="min-distance" min="0" max="100" step="1" value="20"
-                           oninput="document.getElementById('min-distance-value').textContent = this.value">
-
-                    <label for="distance-scale">Distance Scale: <span id="distance-scale-value">10.0</span></label>
-                    <input type="range" id="distance-scale" min="1" max="100" step="1" value="10"
-                           oninput="document.getElementById('distance-scale-value').textContent = this.value">
-                </div>
-
-                <!-- Pruning Settings -->
-                <div class="setting-group">
-                    <h3>Pruning</h3>
-
-                    <label for="max-context-tokens">Max Context Tokens (0 = disabled)</label>
-                    <input type="number" id="max-context-tokens" min="0" max="10000" step="50" value="500">
-                </div>
-
-                <!-- Data Capture -->
-                <div class="setting-group">
-                    <h3>Data Capture</h3>
-                    <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
-                        Writes attention data to disk as tokens generate. Files saved to <code>Capture_Data/</code>.
-                    </p>
-                    <button id="start-capture-button" class="button button-secondary">🎬 Start Capture</button>
-                    <button id="stop-capture-button" class="button button-secondary" style="display: none;">⏹️ Stop Capture</button>
-                    <div id="capture-status" style="font-size: 0.85rem; margin-top: 0.5rem; color: var(--text-secondary);"></div>
-                </div>
-
-                <!-- Actions -->
-                <div class="setting-group">
-                    <button id="clear-button" class="button button-secondary">Clear Chat</button>
-                    <button id="export-button" class="button button-secondary">Export Data</button>
-                </div>
+                <section class="panel">
+                    <h2>Data</h2>
+                    <div class="button-row">
+                        <button id="btn-start-capture" class="btn">🎬 Start Capture</button>
+                        <button id="btn-stop-capture" class="btn" disabled>⏹️ Stop</button>
+                    </div>
+                    <div id="capture-status" class="hint"></div>
+                    <div class="button-row">
+                        <button id="btn-export" class="btn">📤 Export State</button>
+                        <button id="btn-clear" class="btn btn-danger">🗑️ Clear</button>
+                    </div>
+                </section>
             </aside>
 
             <!-- Chat Area -->
-            <main class="chat-area">
-                <!-- Heatmap Visualization -->
-                <div id="heatmap" class="heatmap"></div>
+            <main class="chat">
+                <!-- Token Display -->
+                <div id="tokens" class="tokens"></div>
 
-                <!-- Statistics -->
+                <!-- Stats Bar -->
                 <div id="stats" class="stats">
-                    <div>Loading...</div>
+                    <span>Tokens: <strong id="stat-tokens">0</strong></span>
+                    <span>Brightness: <strong id="stat-brightness">-</strong></span>
+                    <span>Pruned: <strong id="stat-pruned">0</strong></span>
                 </div>
 
-                <!-- Input Area -->
+                <!-- Input -->
                 <div class="input-area">
-                    <textarea id="user-input" placeholder="Type your message..." rows="3"></textarea>
-                    <button id="send-button" class="button button-primary">Send</button>
+                    <textarea id="user-input" placeholder="Type a message..." rows="2"></textarea>
+                    <button id="btn-send" class="btn btn-primary">Send</button>
                 </div>
             </main>
         </div>
-
-        <!-- Footer -->
-        <footer>
-            <p>Halo Weave - Attention-Based Context Management | <a href="https://github.com/RecursiveRabbit/Halo-Weave" target="_blank">GitHub</a></p>
-        </footer>
     </div>
 
-    <!-- Scripts -->
     <script type="module" src="js/app.js"></script>
 </body>
 </html>
