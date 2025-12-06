@@ -32,3 +32,4 @@ tests/captures/*.json
 # Test results (generated reports - can be regenerated)
 tests/strategy_framework/test_results/
 venv/
+tests/captures/
