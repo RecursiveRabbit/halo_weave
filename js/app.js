@@ -30,6 +30,8 @@ class App {
         // DOM elements
         this.elements = {
             status: document.getElementById('status'),
+            userName: document.getElementById('user-name'),
+            aiName: document.getElementById('ai-name'),
             systemPrompt: document.getElementById('system-prompt'),
             maxTokens: document.getElementById('max-tokens'),
             maxTokensVal: document.getElementById('max-tokens-val'),
@@ -42,6 +44,8 @@ class App {
             btnSend: document.getElementById('btn-send'),
             btnClear: document.getElementById('btn-clear'),
             btnExport: document.getElementById('btn-export'),
+            btnImport: document.getElementById('btn-import'),
+            importFile: document.getElementById('import-file'),
             btnStartCapture: document.getElementById('btn-start-capture'),
             btnStopCapture: document.getElementById('btn-stop-capture'),
             captureStatus: document.getElementById('capture-status'),
@@ -96,8 +100,10 @@ class App {
         // Clear button
         this.elements.btnClear.addEventListener('click', () => this._handleClear());
         
-        // Export button
+        // Export/Import buttons
         this.elements.btnExport.addEventListener('click', () => this._handleExport());
+        this.elements.btnImport.addEventListener('click', () => this.elements.importFile.click());
+        this.elements.importFile.addEventListener('change', (e) => this._handleImport(e));
         
         // Capture buttons
         this.elements.btnStartCapture.addEventListener('click', () => this._handleStartCapture());
@@ -153,11 +159,15 @@ class App {
     }
 
     async _addMessage(role, text) {
-        // Format with ChatML
+        // Get custom names (fall back to defaults)
+        const userName = this.elements.userName.value.trim() || 'user';
+        const aiName = this.elements.aiName.value.trim() || 'assistant';
+        
+        // Format with ChatML using custom names
         const formatted = role === 'system' 
             ? `<|im_start|>system\n${text}<|im_end|>\n`
             : role === 'user'
-            ? `<|im_start|>user\n${text}<|im_end|>\n`
+            ? `<|im_start|>${userName}\n${text}<|im_end|>\n`
             : text;
         
         // Tokenize
@@ -178,12 +188,15 @@ class App {
     }
 
     async _generate() {
-        // Start assistant turn
-        this.conversation.currentRole = 'assistant';
+        // Get custom AI name
+        const aiName = this.elements.aiName.value.trim() || 'assistant';
+        
+        // Start AI turn
+        this.conversation.currentRole = 'assistant';  // Internal role stays 'assistant'
         this.conversation.currentSentenceId = 0;
         
-        // Add assistant prefix
-        const prefix = '<|im_start|>assistant\n';
+        // Add AI prefix with custom name
+        const prefix = `<|im_start|>${aiName}\n`;
         const prefixTokens = await this.client.tokenize(prefix);
         for (const t of prefixTokens) {
             const token = this.conversation.addStreamingToken(t.token_id, t.text);
@@ -273,10 +286,7 @@ class App {
                     this.renderer.addToken(token, this.conversation);
                     this._timingStats.renderToken += performance.now() - t1;
                     
-                    // Check pruning budget
-                    t1 = performance.now();
-                    this._checkPruning();
-                    this._timingStats.pruning += performance.now() - t1;
+                    // Note: Pruning moved to onDone - all tokens need a chance to accumulate attention
                     
                     t1 = performance.now();
                     this._updateStats();
@@ -291,6 +301,9 @@ class App {
                 (data) => {
                     console.log('Generation complete:', data);
                     
+                    // Prune after generation - all tokens have had a chance to accumulate attention
+                    this._checkPruning();
+                    
                     // Print timing report
                     const s = this._timingStats;
                     const n = s.count || 1;
@@ -303,7 +316,6 @@ class App {
                     console.log(`   ├─ updateBright:  ${s.updateBrightness.toFixed(1)}ms (${(s.updateBrightness/n).toFixed(2)}ms/token)`);
                     console.log(`   ├─ updateColors:  ${s.updateColors.toFixed(1)}ms (${(s.updateColors/n).toFixed(2)}ms/token)`);
                     console.log(`   ├─ renderToken:   ${s.renderToken.toFixed(1)}ms (${(s.renderToken/n).toFixed(2)}ms/token)`);
-                    console.log(`   ├─ pruning:       ${s.pruning.toFixed(1)}ms (${(s.pruning/n).toFixed(2)}ms/token)`);
                     console.log(`   ├─ stats:         ${s.stats.toFixed(1)}ms (${(s.stats/n).toFixed(2)}ms/token)`);
                     console.log(`   └─ capture:       ${s.capture.toFixed(1)}ms (${(s.capture/n).toFixed(2)}ms/token)`);
                     console.log(`   Unaccounted:      ${(wallClock - s.tokenGaps - s.total).toFixed(0)}ms [browser paint/layout]`);
@@ -369,6 +381,40 @@ class App {
         a.download = `halo_weave_export_${Date.now()}.json`;
         a.click();
         URL.revokeObjectURL(url);
+    }
+
+    _handleImport(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+        
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            try {
+                const state = JSON.parse(e.target.result);
+                
+                // Validate it looks like our export
+                if (!state.tokens || !Array.isArray(state.tokens)) {
+                    throw new Error('Invalid export file: missing tokens array');
+                }
+                
+                // Import state
+                this.conversation.importState(state);
+                
+                // Rebuild UI
+                this.renderer.rebuild(this.conversation);
+                this._updateStats();
+                this.totalPruned = state.stats?.deletedTokens || 0;
+                
+                this._setStatus(`Imported ${state.tokens.length} tokens`, 'success');
+            } catch (err) {
+                console.error('Import error:', err);
+                this._setStatus('Import failed: ' + err.message, 'error');
+            }
+        };
+        reader.readAsText(file);
+        
+        // Reset file input so same file can be re-imported
+        event.target.value = '';
     }
 
     async _checkCaptureServer() {

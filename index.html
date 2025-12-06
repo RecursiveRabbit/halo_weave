@@ -19,8 +19,20 @@
             <!-- Sidebar -->
             <aside class="sidebar">
                 <section class="panel">
+                    <h2>Identity</h2>
+                    <label>
+                        User Name
+                        <input type="text" id="user-name" value="user" placeholder="user">
+                    </label>
+                    <label>
+                        AI Name
+                        <input type="text" id="ai-name" value="Qwen" placeholder="assistant">
+                    </label>
+                </section>
+
+                <section class="panel">
                     <h2>System Prompt</h2>
-                    <textarea id="system-prompt" rows="4">You are a helpful AI assistant.</textarea>
+                    <textarea id="system-prompt" rows="4">You are Qwen, an AI created by Alibaba.</textarea>
                 </section>
 
                 <section class="panel">
@@ -56,7 +68,11 @@
                     </div>
                     <div id="capture-status" class="hint"></div>
                     <div class="button-row">
-                        <button id="btn-export" class="btn">📤 Export State</button>
+                        <button id="btn-export" class="btn">📤 Export</button>
+                        <button id="btn-import" class="btn">📥 Import</button>
+                    </div>
+                    <input type="file" id="import-file" accept=".json" style="display: none;">
+                    <div class="button-row">
                         <button id="btn-clear" class="btn btn-danger">🗑️ Clear</button>
                     </div>
                 </section>

@@ -135,6 +135,21 @@ export class Conversation {
     }
     
     /**
+     * Get count of active tokens excluding current turn
+     * Used for budget checking - current turn is immune until next generation
+     */
+    getPrunableTokenCount() {
+        let count = 0;
+        for (let i = 0; i < this.tokens.length; i++) {
+            const t = this.tokens[i];
+            if (!t.deleted && t.turn_id !== this.currentTurnId) {
+                count++;
+            }
+        }
+        return count;
+    }
+    
+    /**
      * Rebuild active token cache
      */
     _rebuildActiveCache() {
@@ -264,22 +279,26 @@ export class Conversation {
     pruneToFit(maxTokens) {
         let pruned = 0;
         
-        while (this.getActiveTokenCount() > maxTokens) {
+        // Use prunable count - excludes current turn (immune until next generation)
+        while (this.getPrunableTokenCount() > maxTokens) {
             const sentences = this.getSentences();
             
             // Find lowest prunable sentence in single pass
             let lowestSentence = null;
             let lowestPeak = Infinity;
-            let activeSentenceCount = 0;
+            let prunableSentenceCount = 0;
             
             for (let i = 0; i < sentences.length; i++) {
                 const s = sentences[i];
                 if (s.fullyDeleted) continue;
                 
-                activeSentenceCount++;
+                // Skip current turn - immune until next generation
+                if (s.turn_id === this.currentTurnId) continue;
                 
                 // Skip system prompt (turn_id 0, role system) - never prune
                 if (s.turn_id === 0 && s.role === 'system') continue;
+                
+                prunableSentenceCount++;
                 
                 if (s.peakBrightness < lowestPeak) {
                     lowestPeak = s.peakBrightness;
@@ -287,8 +306,8 @@ export class Conversation {
                 }
             }
             
-            // Keep at least one sentence
-            if (activeSentenceCount <= 1) break;
+            // Keep at least one prunable sentence
+            if (prunableSentenceCount <= 1) break;
             
             if (lowestSentence) {
                 this._deleteSentence(lowestSentence);
@@ -342,6 +361,7 @@ export class Conversation {
                     role: token.role,
                     tokens: [],
                     peakBrightness: -Infinity,
+                    peakBrightnessAtDeletion: null,
                     fullyDeleted: true
                 };
                 sentenceMap.set(key, sentence);
@@ -353,6 +373,12 @@ export class Conversation {
                 sentence.fullyDeleted = false;
                 if (token.brightness > sentence.peakBrightness) {
                     sentence.peakBrightness = token.brightness;
+                }
+            } else if (token.brightness_at_deletion !== undefined) {
+                // Track peak brightness at deletion for deleted sentences
+                if (sentence.peakBrightnessAtDeletion === null || 
+                    token.brightness_at_deletion > sentence.peakBrightnessAtDeletion) {
+                    sentence.peakBrightnessAtDeletion = token.brightness_at_deletion;
                 }
             }
         }
@@ -429,7 +455,12 @@ export class Conversation {
      */
     exportState() {
         return {
+            version: 1,
             tokens: this.tokens,
+            currentTurnId: this.currentTurnId,
+            currentRole: this.currentRole,
+            currentSentenceId: this.currentSentenceId,
+            nextPosition: this.nextPosition,
             stats: this.getStats(),
             sentences: this.getSentences().map(s => ({
                 turn_id: s.turn_id,
@@ -437,9 +468,47 @@ export class Conversation {
                 role: s.role,
                 text: this.reconstructText(s.tokens),
                 peakBrightness: s.peakBrightness,
+                peakBrightnessAtDeletion: s.peakBrightnessAtDeletion,
                 tokenCount: s.tokens.length,
                 deleted: s.fullyDeleted
             }))
         };
+    }
+
+    /**
+     * Import state from exported JSON
+     * @param {Object} state - Previously exported state
+     */
+    importState(state) {
+        // Clear current state
+        this.clear();
+        
+        // Restore tokens
+        this.tokens = state.tokens || [];
+        
+        // Infer tracking state from tokens if not in export (older format)
+        let maxTurnId = 0;
+        let maxSentenceId = 0;
+        let lastRole = null;
+        for (const t of this.tokens) {
+            if (t.turn_id > maxTurnId) {
+                maxTurnId = t.turn_id;
+                maxSentenceId = t.sentence_id;
+                lastRole = t.role;
+            } else if (t.turn_id === maxTurnId && t.sentence_id > maxSentenceId) {
+                maxSentenceId = t.sentence_id;
+            }
+        }
+        
+        // Restore tracking state (use saved values or inferred)
+        this.currentTurnId = state.currentTurnId ?? maxTurnId;
+        this.currentRole = state.currentRole ?? lastRole;
+        this.currentSentenceId = state.currentSentenceId ?? maxSentenceId;
+        this.nextPosition = state.nextPosition ?? this.tokens.length;
+        
+        // Invalidate cache
+        this._invalidateCache();
+        
+        console.log(`Imported ${this.tokens.length} tokens, turn ${this.currentTurnId}, sentence ${this.currentSentenceId}`);
     }
 }
