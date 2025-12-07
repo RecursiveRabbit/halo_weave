@@ -126,7 +126,7 @@ class App {
         if (!text || this.isGenerating) return;
         
         console.log('📤 _handleSend starting');
-        this.elements.userInput.value = '';
+        // Don't clear input yet - wait until we know tokenization succeeded
         this.isGenerating = true;
         this.elements.btnSend.disabled = true;
         
@@ -149,6 +149,9 @@ class App {
             await this._addMessage('user', text);
             console.log('📤 User message added, starting generation...');
             
+            // Only clear input after user message successfully added (tokenization worked)
+            this.elements.userInput.value = '';
+            
             // Generate response
             await this._generate();
             
@@ -158,6 +161,7 @@ class App {
         } catch (err) {
             console.error('Generation error:', err);
             this._setStatus('Generation failed: ' + err.message, 'error');
+            // Input is preserved - user can retry after restarting KoboldCPP
         } finally {
             this.isGenerating = false;
             this.elements.btnSend.disabled = false;
