@@ -274,10 +274,10 @@ export class Conversation {
     /**
      * Prune lowest brightness sentences until under token budget
      * @param {number} maxTokens - Maximum allowed active tokens
-     * @returns {number} Number of sentences pruned
+     * @returns {Array} Array of pruned sentence objects (for graveyard)
      */
     pruneToFit(maxTokens) {
-        let pruned = 0;
+        const prunedSentences = [];
         
         // Use prunable count - excludes current turn (immune until next generation)
         while (this.getPrunableTokenCount() > maxTokens) {
@@ -311,13 +311,36 @@ export class Conversation {
             
             if (lowestSentence) {
                 this._deleteSentence(lowestSentence);
-                pruned++;
+                prunedSentences.push(lowestSentence);
             } else {
                 break;
             }
         }
         
-        return pruned;
+        return prunedSentences;
+    }
+    
+    /**
+     * Resurrect a sentence from the graveyard
+     * @param {Array<number>} tokenPositions - Position IDs of tokens to resurrect
+     */
+    resurrect(tokenPositions) {
+        const positionSet = new Set(tokenPositions);
+        let resurrectedCount = 0;
+        
+        for (const token of this.tokens) {
+            if (positionSet.has(token.position) && token.deleted) {
+                token.deleted = false;
+                token.brightness = 255;  // Fresh start
+                resurrectedCount++;
+            }
+        }
+        
+        if (resurrectedCount > 0) {
+            this._invalidateCache();
+        }
+        
+        return resurrectedCount;
     }
 
     /**

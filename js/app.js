@@ -12,6 +12,7 @@ import { KoboldClient } from './kobold_client.js';
 import { Conversation } from './conversation.js';
 import { Renderer } from './renderer.js';
 import { DataCapture } from './data_capture.js';
+import { Graveyard } from './graveyard.js';
 
 class App {
     constructor() {
@@ -20,11 +21,13 @@ class App {
         this.conversation = new Conversation();
         this.renderer = new Renderer(document.getElementById('tokens'));
         this.capture = new DataCapture();
+        this.graveyard = new Graveyard();
         
         // State
         this.isGenerating = false;
         this.generationStep = 0;
         this.totalPruned = 0;
+        this.resurrectionBudget = 512;  // Max tokens to resurrect per user message
         this._statsPending = false;  // Coalesce stats updates with rAF
         
         // DOM elements
@@ -138,6 +141,9 @@ class App {
                 }
             }
             
+            // Query graveyard for relevant context before adding user message
+            await this._resurrectRelevantContext(text);
+            
             // Add user message
             console.log('📤 Adding user message...');
             await this._addMessage('user', text);
@@ -155,6 +161,50 @@ class App {
         } finally {
             this.isGenerating = false;
             this.elements.btnSend.disabled = false;
+        }
+    }
+    
+    /**
+     * Query graveyard and resurrect semantically relevant context
+     * @param {string} userText - The user's message text
+     */
+    async _resurrectRelevantContext(userText) {
+        // Calculate token budget for resurrection
+        // Budget = resurrectionBudget - estimated user message tokens
+        // Rough estimate: 4 chars per token
+        const estimatedUserTokens = Math.ceil(userText.length / 4);
+        const tokenBudget = Math.max(0, this.resurrectionBudget - estimatedUserTokens);
+        
+        if (tokenBudget <= 0) {
+            console.log('🪦 No resurrection budget (user message too long)');
+            return;
+        }
+        
+        // Query graveyard
+        const matches = await this.graveyard.query(userText, 10, tokenBudget);
+        
+        if (matches.length === 0) {
+            console.log('🪦 No relevant context in graveyard');
+            return;
+        }
+        
+        // Resurrect each matching sentence
+        let totalResurrected = 0;
+        for (const match of matches) {
+            const count = this.conversation.resurrect(match.token_positions);
+            if (count > 0) {
+                // Remove from graveyard (it's alive again)
+                this.graveyard.remove(match);
+                totalResurrected += count;
+                console.log(`🪦 Resurrected ${count} tokens: "${match.text.substring(0, 50)}..." (similarity: ${match.similarity.toFixed(3)})`);
+            }
+        }
+        
+        if (totalResurrected > 0) {
+            // Rebuild UI to show resurrected tokens
+            this.renderer.rebuild(this.conversation);
+            this._updateStats();
+            console.log(`🪦 Total resurrected: ${totalResurrected} tokens from ${matches.length} sentences`);
         }
     }
 
@@ -321,6 +371,21 @@ class App {
                     console.log(`   Unaccounted:      ${(wallClock - s.tokenGaps - s.total).toFixed(0)}ms [browser paint/layout]`);
                     console.log(`   Attention size:   ${(s.attentionSize / 1024 / 1024).toFixed(1)}MB per token`);
                     
+                    // Graveyard timing report
+                    const g = this.graveyard.getTiming(true);  // Get and reset
+                    const gStats = this.graveyard.getStats();
+                    if (g.embedCount > 0 || g.queryCount > 0) {
+                        console.log(`\n🪦 GRAVEYARD TIMING`);
+                        console.log(`   Entries:          ${gStats.entries} (${gStats.embedded} embedded, ${gStats.tokens} tokens)`);
+                        if (g.embedCount > 0) {
+                            console.log(`   Embed:            ${g.totalEmbedMs.toFixed(1)}ms total (${g.avgEmbedMs.toFixed(1)}ms avg, ${g.embedCount} calls)`);
+                        }
+                        if (g.queryCount > 0) {
+                            console.log(`   Query:            ${g.totalQueryMs.toFixed(1)}ms total (${g.avgQueryMs.toFixed(1)}ms avg, ${g.queryCount} calls)`);
+                            console.log(`   └─ Search:        ${g.lastSearchMs.toFixed(1)}ms [cosine similarity + sort]`);
+                        }
+                    }
+                    
                     resolve();
                 },
                 // onError callback
@@ -352,11 +417,18 @@ class App {
         const maxContext = parseInt(this.elements.maxContext.value);
         if (maxContext <= 0) return;  // Pruning disabled
         
-        const pruned = this.conversation.pruneToFit(maxContext);
-        if (pruned > 0) {
-            this.totalPruned += pruned;
+        const prunedSentences = this.conversation.pruneToFit(maxContext);
+        if (prunedSentences.length > 0) {
+            this.totalPruned += prunedSentences.length;
             this.renderer.rebuild(this.conversation);
-            console.log(`Pruned ${pruned} sentences to fit budget`);
+            
+            // Send pruned sentences to graveyard
+            for (const sentence of prunedSentences) {
+                const text = this.conversation.reconstructText(sentence.tokens);
+                this.graveyard.add(sentence, text);
+            }
+            
+            console.log(`Pruned ${prunedSentences.length} sentences to fit budget`);
         }
     }
 
@@ -364,13 +436,17 @@ class App {
         if (this.isGenerating) return;
         
         this.conversation.clear();
+        this.graveyard.clear();
         this.renderer.clear();
         this.totalPruned = 0;
         this._updateStats();
     }
 
     _handleExport() {
-        const state = this.conversation.exportState();
+        const state = {
+            conversation: this.conversation.exportState(),
+            graveyard: this.graveyard.exportState()
+        };
         const json = JSON.stringify(state, null, 2);
         
         // Download as file
@@ -390,22 +466,32 @@ class App {
         const reader = new FileReader();
         reader.onload = (e) => {
             try {
-                const state = JSON.parse(e.target.result);
+                const data = JSON.parse(e.target.result);
+                
+                // Handle both old format (flat) and new format (nested)
+                const conversationState = data.conversation || data;
+                const graveyardState = data.graveyard || null;
                 
                 // Validate it looks like our export
-                if (!state.tokens || !Array.isArray(state.tokens)) {
+                if (!conversationState.tokens || !Array.isArray(conversationState.tokens)) {
                     throw new Error('Invalid export file: missing tokens array');
                 }
                 
-                // Import state
-                this.conversation.importState(state);
+                // Import conversation state
+                this.conversation.importState(conversationState);
+                
+                // Import graveyard state if present
+                if (graveyardState) {
+                    this.graveyard.importState(graveyardState);
+                }
                 
                 // Rebuild UI
                 this.renderer.rebuild(this.conversation);
                 this._updateStats();
-                this.totalPruned = state.stats?.deletedTokens || 0;
+                this.totalPruned = conversationState.stats?.deletedTokens || 0;
                 
-                this._setStatus(`Imported ${state.tokens.length} tokens`, 'success');
+                const graveyardInfo = graveyardState ? `, ${graveyardState.entries?.length || 0} in graveyard` : '';
+                this._setStatus(`Imported ${conversationState.tokens.length} tokens${graveyardInfo}`, 'success');
             } catch (err) {
                 console.error('Import error:', err);
                 this._setStatus('Import failed: ' + err.message, 'error');
