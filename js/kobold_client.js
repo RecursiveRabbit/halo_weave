@@ -11,9 +11,32 @@ export class KoboldClient {
     constructor(baseUrl = 'http://localhost:5001') {
         this.baseUrl = baseUrl;
         this.wsUrl = baseUrl.replace(/^http/, 'ws');
-        this.ws = null;
+        this.ws = null;  // Track active WebSocket for cleanup
         this.modelInfo = null;
         this.useWebSocket = true;  // Prefer WebSocket for binary streaming
+    }
+
+    /**
+     * Force-close any active WebSocket connection.
+     * Browser WebSockets wait for close handshake acknowledgment (can take 10s+).
+     * This immediately terminates the connection without waiting.
+     */
+    _forceCloseWebSocket() {
+        if (this.ws) {
+            console.log('🔌 Force-closing lingering WebSocket');
+            // Remove all handlers to prevent callbacks during close
+            this.ws.onopen = null;
+            this.ws.onmessage = null;
+            this.ws.onerror = null;
+            this.ws.onclose = null;
+            // Close immediately - don't wait for handshake
+            try {
+                this.ws.close();
+            } catch (e) {
+                // Ignore errors during force-close
+            }
+            this.ws = null;
+        }
     }
 
     /**
@@ -116,6 +139,10 @@ export class KoboldClient {
      * Zero-copy attention decoding - ~99% faster than SSE+base64
      */
     async _generateStreamWS(inputIds, config, onToken, onDone, onError) {
+        // Force-close any lingering WebSocket from previous generation
+        // This prevents connection buildup that causes tokenization timeouts
+        this._forceCloseWebSocket();
+        
         return new Promise((resolve, reject) => {
             const requestId = this._generateRequestId();
             let pendingToken = null;
@@ -127,6 +154,7 @@ export class KoboldClient {
             const numHeads = this.modelInfo?.num_attention_heads || 28;
             
             const ws = new WebSocket(`${this.wsUrl}/api/extra/generate/stream/ws`);
+            this.ws = ws;  // Track for cleanup
             ws.binaryType = 'arraybuffer';
             
             ws.onopen = () => {
@@ -161,6 +189,10 @@ export class KoboldClient {
                         const elapsed = (performance.now() - startTime) / 1000;
                         console.log(`🚀 WebSocket: ${tokenCount} tokens in ${elapsed.toFixed(1)}s (${(tokenCount/elapsed).toFixed(1)} tok/s)`);
                         pendingToken = null;
+                        // Clear reference before close to prevent race conditions
+                        if (this.ws === ws) {
+                            this.ws = null;
+                        }
                         ws.close();
                         onDone(data);
                         resolve();
@@ -190,6 +222,10 @@ export class KoboldClient {
                 console.error('WebSocket error:', error);
                 console.log('Falling back to SSE...');
                 this.useWebSocket = false;
+                // Clear reference before close
+                if (this.ws === ws) {
+                    this.ws = null;
+                }
                 ws.close();
                 // Fallback to SSE
                 this._generateStreamSSE(inputIds, config, onToken, onDone, onError)
@@ -198,6 +234,10 @@ export class KoboldClient {
             };
             
             ws.onclose = (event) => {
+                // Clear tracked reference
+                if (this.ws === ws) {
+                    this.ws = null;
+                }
                 if (!event.wasClean && pendingToken) {
                     onError(new Error(`WebSocket closed unexpectedly: ${event.code}`));
                     reject(new Error(`WebSocket closed: ${event.code}`));
@@ -382,10 +422,17 @@ export class KoboldClient {
     }
 
     /**
-     * Close any active connections (no-op for SSE, kept for API compatibility)
+     * Close any active connections and abort pending operations
      */
     disconnect() {
-        // SSE connections close automatically, nothing to do
+        this._forceCloseWebSocket();
+    }
+
+    /**
+     * Abort any active generation (alias for disconnect)
+     */
+    abort() {
+        this._forceCloseWebSocket();
     }
 
     /**
