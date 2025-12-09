@@ -12,7 +12,7 @@ import { KoboldClient } from './kobold_client.js';
 import { Conversation } from './conversation.js';
 import { Renderer } from './renderer.js';
 import { DataCapture } from './data_capture.js';
-import { Graveyard } from './graveyard.js';
+import { SemanticIndex } from './semantic_index.js';
 
 class App {
     constructor() {
@@ -21,7 +21,7 @@ class App {
         this.conversation = new Conversation();
         this.renderer = new Renderer(document.getElementById('tokens'));
         this.capture = new DataCapture();
-        this.graveyard = new Graveyard();
+        this.semanticIndex = new SemanticIndex();
         
         // State
         this.isGenerating = false;
@@ -169,7 +169,7 @@ class App {
     }
     
     /**
-     * Query graveyard and resurrect semantically relevant context
+     * Query semantic index and resurrect relevant pruned context
      * @param {string} userText - The user's message text
      */
     async _resurrectRelevantContext(userText) {
@@ -180,27 +180,40 @@ class App {
         const tokenBudget = Math.max(0, this.resurrectionBudget - estimatedUserTokens);
         
         if (tokenBudget <= 0) {
-            console.log('🪦 No resurrection budget (user message too long)');
+            console.log('📚 No resurrection budget (user message too long)');
             return;
         }
         
-        // Query graveyard
-        const matches = await this.graveyard.query(userText, 10, tokenBudget);
+        // Query semantic index
+        const matches = await this.semanticIndex.query(userText, {
+            maxResults: 20,
+            tokenBudget: tokenBudget
+        });
         
         if (matches.length === 0) {
-            console.log('🪦 No relevant context in graveyard');
+            console.log('📚 No relevant context in semantic index');
             return;
         }
         
-        // Resurrect each matching sentence
+        // Resurrect each matching chunk (only if currently dead)
         let totalResurrected = 0;
         for (const match of matches) {
-            const count = this.conversation.resurrect(match.token_positions);
+            // Skip if chunk is already alive
+            if (this.conversation.isChunkAlive(match.turn_id, match.sentence_id, match.role)) {
+                continue;
+            }
+            
+            const count = this.conversation.resurrectByTuple(
+                match.turn_id, 
+                match.sentence_id, 
+                match.role
+            );
+            
             if (count > 0) {
-                // Remove from graveyard (it's alive again)
-                this.graveyard.remove(match);
+                // Mark as referenced in index (for stats/pruning priority)
+                this.semanticIndex.markReferenced(match.turn_id, match.sentence_id, match.role);
                 totalResurrected += count;
-                console.log(`🪦 Resurrected ${count} tokens: "${match.text.substring(0, 50)}..." (similarity: ${match.similarity.toFixed(3)})`);
+                console.log(`📚 Resurrected ${count} tokens: "${match.text.substring(0, 50)}..." (similarity: ${match.similarity.toFixed(3)})`);
             }
         }
         
@@ -208,7 +221,7 @@ class App {
             // Rebuild UI to show resurrected tokens
             this.renderer.rebuild(this.conversation);
             this._updateStats();
-            console.log(`🪦 Total resurrected: ${totalResurrected} tokens from ${matches.length} sentences`);
+            console.log(`📚 Total resurrected: ${totalResurrected} tokens from semantic index`);
         }
     }
 
@@ -352,8 +365,12 @@ class App {
                     this.generationStep++;
                 },
                 // onDone callback
-                (data) => {
+                async (data) => {
                     console.log('Generation complete:', data);
+                    
+                    // Index new chunks after generation completes
+                    // This happens while user reads response (hides latency)
+                    await this.semanticIndex.indexNewChunks(this.conversation);
                     
                     // Prune after generation - all tokens have had a chance to accumulate attention
                     this._checkPruning();
@@ -375,18 +392,18 @@ class App {
                     console.log(`   Unaccounted:      ${(wallClock - s.tokenGaps - s.total).toFixed(0)}ms [browser paint/layout]`);
                     console.log(`   Attention size:   ${(s.attentionSize / 1024 / 1024).toFixed(1)}MB per token`);
                     
-                    // Graveyard timing report
-                    const g = this.graveyard.getTiming(true);  // Get and reset
-                    const gStats = this.graveyard.getStats();
-                    if (g.embedCount > 0 || g.queryCount > 0) {
-                        console.log(`\n🪦 GRAVEYARD TIMING`);
-                        console.log(`   Entries:          ${gStats.entries} (${gStats.embedded} embedded, ${gStats.tokens} tokens)`);
-                        if (g.embedCount > 0) {
-                            console.log(`   Embed:            ${g.totalEmbedMs.toFixed(1)}ms total (${g.avgEmbedMs.toFixed(1)}ms avg, ${g.embedCount} calls)`);
+                    // Semantic index timing report
+                    const idx = this.semanticIndex.getTiming(true);  // Get and reset
+                    const idxStats = this.semanticIndex.getStats();
+                    if (idx.embedCount > 0 || idx.queryCount > 0) {
+                        console.log(`\n📚 SEMANTIC INDEX TIMING`);
+                        console.log(`   Entries:          ${idxStats.entries} (${idxStats.embedded} embedded, ${idxStats.tokens} tokens)`);
+                        if (idx.embedCount > 0) {
+                            console.log(`   Embed:            ${idx.totalEmbedMs.toFixed(1)}ms total (${idx.avgEmbedMs.toFixed(1)}ms avg, ${idx.embedCount} calls)`);
                         }
-                        if (g.queryCount > 0) {
-                            console.log(`   Query:            ${g.totalQueryMs.toFixed(1)}ms total (${g.avgQueryMs.toFixed(1)}ms avg, ${g.queryCount} calls)`);
-                            console.log(`   └─ Search:        ${g.lastSearchMs.toFixed(1)}ms [cosine similarity + sort]`);
+                        if (idx.queryCount > 0) {
+                            console.log(`   Query:            ${idx.totalQueryMs.toFixed(1)}ms total (${idx.avgQueryMs.toFixed(1)}ms avg, ${idx.queryCount} calls)`);
+                            console.log(`   └─ Search:        ${idx.lastSearchMs.toFixed(1)}ms [cosine similarity + sort]`);
                         }
                     }
                     
@@ -426,13 +443,8 @@ class App {
             this.totalPruned += prunedSentences.length;
             this.renderer.rebuild(this.conversation);
             
-            // Send pruned sentences to graveyard
-            for (const sentence of prunedSentences) {
-                const text = this.conversation.reconstructText(sentence.tokens);
-                this.graveyard.add(sentence, text);
-            }
-            
-            console.log(`Pruned ${prunedSentences.length} sentences to fit budget`);
+            // No need to add to semantic index - chunks are already indexed on creation
+            console.log(`Pruned ${prunedSentences.length} chunks to fit budget`);
         }
     }
 
@@ -440,7 +452,7 @@ class App {
         if (this.isGenerating) return;
         
         this.conversation.clear();
-        this.graveyard.clear();
+        this.semanticIndex.clear();
         this.renderer.clear();
         this.totalPruned = 0;
         this._updateStats();
@@ -449,7 +461,7 @@ class App {
     _handleExport() {
         const state = {
             conversation: this.conversation.exportState(),
-            graveyard: this.graveyard.exportState()
+            semanticIndex: this.semanticIndex.exportState()
         };
         const json = JSON.stringify(state, null, 2);
         
@@ -463,18 +475,19 @@ class App {
         URL.revokeObjectURL(url);
     }
 
-    _handleImport(event) {
+    async _handleImport(event) {
         const file = event.target.files[0];
         if (!file) return;
         
         const reader = new FileReader();
-        reader.onload = (e) => {
+        reader.onload = async (e) => {
             try {
                 const data = JSON.parse(e.target.result);
                 
-                // Handle both old format (flat) and new format (nested)
+                // Handle old format (flat), graveyard format, and new semantic index format
                 const conversationState = data.conversation || data;
-                const graveyardState = data.graveyard || null;
+                const semanticIndexState = data.semanticIndex || null;
+                const graveyardState = data.graveyard || null;  // Legacy support
                 
                 // Validate it looks like our export
                 if (!conversationState.tokens || !Array.isArray(conversationState.tokens)) {
@@ -484,9 +497,19 @@ class App {
                 // Import conversation state
                 this.conversation.importState(conversationState);
                 
-                // Import graveyard state if present
-                if (graveyardState) {
-                    this.graveyard.importState(graveyardState);
+                // Import semantic index state if present
+                if (semanticIndexState) {
+                    await this.semanticIndex.importState(semanticIndexState);
+                } else if (graveyardState) {
+                    // Legacy: migrate graveyard entries to semantic index
+                    console.log('📚 Migrating legacy graveyard to semantic index...');
+                    this.semanticIndex.clear();
+                    // Re-index all chunks from conversation
+                    await this.semanticIndex.indexNewChunks(this.conversation);
+                } else {
+                    // No index data - rebuild from conversation
+                    this.semanticIndex.clear();
+                    await this.semanticIndex.indexNewChunks(this.conversation);
                 }
                 
                 // Rebuild UI
@@ -494,8 +517,8 @@ class App {
                 this._updateStats();
                 this.totalPruned = conversationState.stats?.deletedTokens || 0;
                 
-                const graveyardInfo = graveyardState ? `, ${graveyardState.entries?.length || 0} in graveyard` : '';
-                this._setStatus(`Imported ${conversationState.tokens.length} tokens${graveyardInfo}`, 'success');
+                const indexInfo = `, ${this.semanticIndex.getStats().entries} in semantic index`;
+                this._setStatus(`Imported ${conversationState.tokens.length} tokens${indexInfo}`, 'success');
             } catch (err) {
                 console.error('Import error:', err);
                 this._setStatus('Import failed: ' + err.message, 'error');

@@ -30,6 +30,11 @@ export class Conversation {
         // Sentence tracking within current turn
         this.currentSentenceId = 0;
         
+        // Short line merging: track tokens in current line
+        // Lines under minLineTokens merge forward into next line
+        this.currentLineTokenCount = 0;
+        this.minLineTokens = 10;  // Configurable threshold
+        
         // === OPTIMIZATION: Cached active token list ===
         // Invalidated on add/delete, rebuilt lazily
         this._activeTokensCache = null;
@@ -95,14 +100,29 @@ export class Conversation {
     }
 
     /**
-     * Detect paragraph boundaries (newlines only)
-     * Simpler and more reliable than sentence detection
+     * Detect chunk boundaries with short line merging
+     * 
+     * Lines under minLineTokens (default 10) merge forward into the next line.
+     * This keeps semantic units together (e.g., "Groceries:" + "- Milk" + "- Eggs").
+     * 
+     * A chunk boundary only occurs when:
+     * 1. A newline is encountered, AND
+     * 2. The line that just ended has >= minLineTokens tokens
      */
     _updateSentenceBoundary(text) {
-        // Paragraph = newline-delimited chunk
-        // This avoids mid-sentence splits on abbreviations like "Dr." or "U.S."
+        // Count this token toward current line
+        this.currentLineTokenCount++;
+        
         if (text.includes('\n')) {
-            this.currentSentenceId++;
+            // Line ended - check if it's long enough to be its own chunk
+            if (this.currentLineTokenCount >= this.minLineTokens) {
+                // Long line: create chunk boundary
+                this.currentSentenceId++;
+            }
+            // Short line: no boundary, tokens merge into next line's chunk
+            
+            // Reset for next line
+            this.currentLineTokenCount = 0;
         }
     }
 
@@ -112,6 +132,7 @@ export class Conversation {
     nextTurn() {
         this.currentTurnId++;
         this.currentSentenceId = 0;
+        this.currentLineTokenCount = 0;
     }
 
     /**
@@ -279,8 +300,9 @@ export class Conversation {
     pruneToFit(maxTokens) {
         const prunedSentences = [];
         
-        // Use prunable count - excludes current turn (immune until next generation)
-        while (this.getPrunableTokenCount() > maxTokens) {
+        // Check total active tokens (including current turn) against budget
+        // Current turn is immune from deletion, but still counts toward the limit
+        while (this.getActiveTokenCount() > maxTokens) {
             const sentences = this.getSentences();
             
             // Find lowest prunable sentence in single pass
@@ -321,7 +343,7 @@ export class Conversation {
     }
     
     /**
-     * Resurrect a sentence from the graveyard
+     * Resurrect a sentence from the graveyard (legacy - by position IDs)
      * @param {Array<number>} tokenPositions - Position IDs of tokens to resurrect
      */
     resurrect(tokenPositions) {
@@ -341,6 +363,53 @@ export class Conversation {
         }
         
         return resurrectedCount;
+    }
+    
+    /**
+     * Resurrect a chunk by tuple (for semantic index)
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence/chunk ID
+     * @param {string} role - Role ("system", "user", "assistant")
+     * @returns {number} Count of tokens resurrected
+     */
+    resurrectByTuple(turn_id, sentence_id, role) {
+        let resurrectedCount = 0;
+        
+        for (const token of this.tokens) {
+            if (token.turn_id === turn_id && 
+                token.sentence_id === sentence_id && 
+                token.role === role &&
+                token.deleted) {
+                token.deleted = false;
+                token.brightness = 255;  // Fresh start
+                resurrectedCount++;
+            }
+        }
+        
+        if (resurrectedCount > 0) {
+            this._invalidateCache();
+        }
+        
+        return resurrectedCount;
+    }
+    
+    /**
+     * Check if a chunk is currently alive (not deleted)
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence/chunk ID  
+     * @param {string} role - Role
+     * @returns {boolean} True if any token in chunk is alive
+     */
+    isChunkAlive(turn_id, sentence_id, role) {
+        for (const token of this.tokens) {
+            if (token.turn_id === turn_id && 
+                token.sentence_id === sentence_id && 
+                token.role === role &&
+                !token.deleted) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -469,6 +538,7 @@ export class Conversation {
         this.currentTurnId = 0;
         this.currentRole = null;
         this.currentSentenceId = 0;
+        this.currentLineTokenCount = 0;
         this._activeTokensCache = null;
         this._activeTokenCount = 0;
     }

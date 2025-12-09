@@ -439,6 +439,14 @@ ws.onmessage = (event) => {
         pendingToken = null;
     }
 };
+
+// IMPORTANT: Close handling
+// The server uses a simple HTTP handler with WebSocket bolted on.
+// The close handshake may not complete cleanly. Clients should:
+// - Not block waiting for close acknowledgment
+// - Set short close timeouts (Python websockets: close_timeout=0.1)
+// - Browser WebSocket.close() is non-blocking by default (no issue)
+ws.onclose = () => console.log('Connection closed');
 ```
 
 **Performance Comparison**:
