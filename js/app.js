@@ -32,6 +32,25 @@ class App {
             return isPinned;
         };
         
+        this.renderer.onMerge = async (turnId, sentenceId, role) => {
+            // Merge tokens in conversation (finds previous non-empty sentence)
+            const { success, targetSentenceId } = this.conversation.mergeSentenceIntoPrevious(turnId, sentenceId, role);
+            if (!success) return;
+            
+            // Delete old entries from semantic index
+            this.semanticIndex.deleteEntry(turnId, sentenceId, role);
+            this.semanticIndex.deleteEntry(turnId, targetSentenceId, role);
+            
+            // Re-index the merged chunk
+            await this.semanticIndex.reindexChunk(this.conversation, turnId, targetSentenceId, role);
+            
+            // Rebuild renderer
+            this.renderer.rebuild(this.conversation);
+            this._updateStats();
+            
+            console.log(`✅ Merged sentence ${sentenceId} into ${targetSentenceId}`);
+        };
+        
         // State
         this.isGenerating = false;
         this.generationStep = 0;

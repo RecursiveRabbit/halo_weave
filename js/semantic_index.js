@@ -448,6 +448,79 @@ export class SemanticIndex {
     }
 
     /**
+     * Delete an entry from the index
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence/chunk ID
+     * @param {string} role - Role
+     * @returns {boolean} True if entry was found and deleted
+     */
+    deleteEntry(turn_id, sentence_id, role) {
+        const key = this._chunkKey(turn_id, sentence_id, role);
+        const idx = this.entries.findIndex(e => 
+            this._chunkKey(e.turn_id, e.sentence_id, e.role) === key
+        );
+        
+        if (idx !== -1) {
+            this.entries.splice(idx, 1);
+            console.log(`📚 Deleted index entry for turn ${turn_id}, sentence ${sentence_id}`);
+            return true;
+        }
+        return false;
+    }
+    
+    /**
+     * Re-index a specific chunk (delete old entry and create new one)
+     * @param {Conversation} conversation - The conversation object
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence/chunk ID
+     * @param {string} role - Role
+     */
+    async reindexChunk(conversation, turn_id, sentence_id, role) {
+        // Delete existing entry
+        this.deleteEntry(turn_id, sentence_id, role);
+        
+        // Get the sentence from conversation
+        const sentences = conversation.getSentences();
+        const sentence = sentences.find(s => 
+            s.turn_id === turn_id && 
+            s.sentence_id === sentence_id && 
+            s.role === role
+        );
+        
+        if (!sentence || sentence.tokens.length === 0) {
+            console.log(`📚 No tokens found for turn ${turn_id}, sentence ${sentence_id} - skipping reindex`);
+            return;
+        }
+        
+        // Build text from tokens
+        const text = sentence.tokens.map(t => t.text).join('');
+        const tokenCount = sentence.tokens.length;
+        
+        // Build context window
+        const contextText = this._buildContextWindow(sentence, sentences, conversation);
+        
+        // Create new entry
+        const entry = {
+            turn_id,
+            sentence_id,
+            role,
+            text,
+            tokenCount,
+            embedding: null,
+            referenceCount: 0,
+            indexedAt: Date.now()
+        };
+        
+        this.entries.push(entry);
+        this.totalIndexed++;
+        
+        // Queue embedding
+        this._queueEmbedding(entry, contextText);
+        
+        console.log(`📚 Reindexed turn ${turn_id}, sentence ${sentence_id} (${tokenCount} tokens)`);
+    }
+
+    /**
      * Cosine similarity between two vectors
      */
     _cosineSimilarity(a, b) {

@@ -19,6 +19,7 @@ export class Renderer {
         this.lastParagraphPeak = new Map(); // "turn_id:sentence_id" -> last peak brightness
         this.pendingUpdate = false;         // Coalesce updates with rAF
         this.onPinToggle = null;            // Callback: (turnId, sentenceId, role) => newPinnedState
+        this.onMerge = null;                // Callback: (turnId, sentenceId, role) => void
     }
 
     /**
@@ -219,6 +220,23 @@ export class Renderer {
         // Add chunk separator for all but first chunk in turn
         if (sentenceId > 0) {
             span.classList.add('chunk-boundary');
+            
+            // Add merge button on the boundary line
+            const mergeBtn = document.createElement('button');
+            mergeBtn.className = 'merge-btn';
+            mergeBtn.textContent = '➕';
+            mergeBtn.title = 'Merge this chunk into the previous chunk';
+            mergeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (this.onMerge) {
+                    this.onMerge(
+                        parseInt(span.dataset.turnId),
+                        parseInt(span.dataset.sentenceId),
+                        span.dataset.role
+                    );
+                }
+            });
+            span.appendChild(mergeBtn);
         }
         
         // Add pin button

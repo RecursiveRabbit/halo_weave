@@ -473,6 +473,58 @@ export class Conversation {
     }
     
     /**
+     * Merge a sentence into the previous non-empty sentence
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence/chunk ID to merge
+     * @param {string} role - Role
+     * @returns {{success: boolean, targetSentenceId: number}} Result with target sentence ID
+     */
+    mergeSentenceIntoPrevious(turn_id, sentence_id, role) {
+        if (sentence_id <= 0) {
+            console.warn('Cannot merge sentence 0 - no previous sentence');
+            return { success: false, targetSentenceId: -1 };
+        }
+        
+        // Find the previous sentence that actually has tokens
+        // (in case previous sentences were already merged away)
+        let targetSentenceId = -1;
+        for (let i = sentence_id - 1; i >= 0; i--) {
+            const hasTokens = this.tokens.some(t => 
+                t.turn_id === turn_id && 
+                t.sentence_id === i && 
+                t.role === role
+            );
+            if (hasTokens) {
+                targetSentenceId = i;
+                break;
+            }
+        }
+        
+        if (targetSentenceId === -1) {
+            console.warn(`No previous sentence with tokens found for turn ${turn_id}, sentence ${sentence_id}`);
+            return { success: false, targetSentenceId: -1 };
+        }
+        
+        let mergedCount = 0;
+        
+        for (const token of this.tokens) {
+            if (token.turn_id === turn_id && 
+                token.sentence_id === sentence_id && 
+                token.role === role) {
+                token.sentence_id = targetSentenceId;
+                mergedCount++;
+            }
+        }
+        
+        if (mergedCount > 0) {
+            this._invalidateCache();
+            console.log(`Merged ${mergedCount} tokens from sentence ${sentence_id} into ${targetSentenceId}`);
+        }
+        
+        return { success: mergedCount > 0, targetSentenceId };
+    }
+    
+    /**
      * Check if a chunk is currently alive (not deleted)
      * @param {number} turn_id - Turn ID
      * @param {number} sentence_id - Sentence/chunk ID  
