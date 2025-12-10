@@ -210,10 +210,9 @@ class App {
             return;
         }
         
-        // Query semantic index
+        // Query semantic index for top candidates (budget filtering done below)
         const matches = await this.semanticIndex.query(userText, {
-            maxResults: 20,
-            tokenBudget: tokenBudget
+            maxResults: 128
         });
         
         if (matches.length === 0) {
@@ -223,15 +222,23 @@ class App {
         
         console.log(`   Matches: ${matches.length} chunks found`);
         
-        // Resurrect each matching chunk (only if currently dead)
+        // Resurrect matching chunks until budget exhausted
         let totalResurrected = 0;
+        let tokensUsed = 0;
         const resurrectedChunks = [];
         const skippedAlive = [];
+        const skippedBudget = [];
         
         for (const match of matches) {
             // Skip if chunk is already alive
             if (this.conversation.isChunkAlive(match.turn_id, match.sentence_id, match.role)) {
                 skippedAlive.push(match);
+                continue;
+            }
+            
+            // Skip if would exceed budget
+            if (tokensUsed + match.tokenCount > tokenBudget) {
+                skippedBudget.push(match);
                 continue;
             }
             
@@ -245,6 +252,7 @@ class App {
                 // Mark as referenced in index (for stats/pruning priority)
                 this.semanticIndex.markReferenced(match.turn_id, match.sentence_id, match.role);
                 totalResurrected += count;
+                tokensUsed += count;
                 resurrectedChunks.push({ match, count });
             }
         }
@@ -252,6 +260,9 @@ class App {
         // Log results
         if (skippedAlive.length > 0) {
             console.log(`   Skipped (already alive): ${skippedAlive.length} chunks`);
+        }
+        if (skippedBudget.length > 0) {
+            console.log(`   Skipped (budget full): ${skippedBudget.length} chunks`);
         }
         
         if (resurrectedChunks.length > 0) {

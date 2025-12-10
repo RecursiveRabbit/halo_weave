@@ -89,8 +89,10 @@ export class Conversation {
         
         this.tokens.push(token);
         
-        // Invalidate cache and update count
-        // Optimization: append to cache instead of full invalidate
+        // SAFETY: Append-to-cache optimization is safe because:
+        // 1. Tokens are only added via _addToken(), never modified during add
+        // 2. New tokens always start with deleted=false
+        // 3. Cache is invalidated on any deletion operation (_invalidateCache)
         if (this._activeTokensCache !== null) {
             this._activeTokensCache.push(token);
             this._activeTokenCount++;

@@ -24,7 +24,7 @@ export class SemanticIndex {
         // Configuration
         this.embeddingDim = 384;  // all-MiniLM-L6-v2 output dimension
         this.embeddingContextTokens = options.embeddingContextTokens || 256;
-        this.queryMaxResults = options.queryMaxResults || 20;
+        this.queryMaxResults = options.queryMaxResults || 128;
         this.resurrectionBudget = options.resurrectionBudget || 1024;
         
         // Model loading state
@@ -60,6 +60,10 @@ export class SemanticIndex {
         this._workerPending = new Map();  // id -> {resolve, reject}
         this._nextEmbedId = 0;
         
+        // Promise-based worker ready signaling
+        this._workerReadyPromise = null;
+        this._resolveWorkerReady = null;
+        
         // Try to initialize worker
         this._initWorker();
     }
@@ -73,6 +77,13 @@ export class SemanticIndex {
             const scriptUrl = new URL('./embedding_worker.js', import.meta.url);
             this._worker = new Worker(scriptUrl, { type: 'module' });
             
+            // Create promise for worker ready signaling
+            this._workerReadyPromise = new Promise((resolve, reject) => {
+                this._resolveWorkerReady = resolve;
+                // Timeout after 30s
+                setTimeout(() => reject(new Error('Worker init timeout')), 30000);
+            });
+            
             this._worker.onmessage = (event) => {
                 const { type, id, embedding, elapsed, error } = event.data;
                 
@@ -80,6 +91,7 @@ export class SemanticIndex {
                     case 'ready':
                         this._workerReady = true;
                         this.modelReady = true;
+                        this._resolveWorkerReady?.();
                         console.log('📚 SemanticIndex: Embedding worker ready');
                         break;
                         
@@ -128,13 +140,14 @@ export class SemanticIndex {
         // If worker is ready, we're good
         if (this._workerReady) return true;
         
-        // If worker exists but not ready, wait for it
-        if (this._worker && !this._workerReady) {
-            // Wait up to 30s for worker to be ready
-            for (let i = 0; i < 300; i++) {
-                await new Promise(r => setTimeout(r, 100));
-                if (this._workerReady) return true;
-                if (!this._worker) break;  // Worker failed
+        // If worker exists but not ready, wait for it via promise
+        if (this._worker && this._workerReadyPromise) {
+            try {
+                await this._workerReadyPromise;
+                return true;
+            } catch (err) {
+                // Worker failed or timed out, fall through to main thread
+                console.warn('📚 Worker init failed:', err.message);
             }
         }
         
@@ -292,10 +305,12 @@ export class SemanticIndex {
      * Build context window for embedding (N-1, N, N+1, ... up to token budget)
      */
     _buildContextWindow(targetSentence, allSentences, conversation) {
-        // Sort sentences by position (turn_id, then sentence_id)
+        // Sort sentences by position (turn_id, then sentence_id, then role for stability)
+        const roleNum = { system: 0, user: 1, assistant: 2 };
         const sorted = [...allSentences].sort((a, b) => {
             if (a.turn_id !== b.turn_id) return a.turn_id - b.turn_id;
-            return a.sentence_id - b.sentence_id;
+            if (a.sentence_id !== b.sentence_id) return a.sentence_id - b.sentence_id;
+            return (roleNum[a.role] || 0) - (roleNum[b.role] || 0);
         });
         
         // Find target index
@@ -399,19 +414,14 @@ export class SemanticIndex {
         
         this._timing.lastSearchMs = performance.now() - tSearch;
         
-        // Select entries within token budget
+        // Return top N results by similarity (budget filtering happens in caller)
         const results = [];
-        let tokensUsed = 0;
-        
         for (const { entry, similarity } of scored) {
             if (results.length >= maxResults) break;
-            if (tokensUsed + entry.tokenCount > tokenBudget) continue;
-            
             results.push({
                 ...entry,
                 similarity
             });
-            tokensUsed += entry.tokenCount;
         }
         
         // Track timing

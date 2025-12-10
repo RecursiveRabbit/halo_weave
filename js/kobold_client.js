@@ -238,10 +238,14 @@ export class KoboldClient {
                 if (this.ws === ws) {
                     this.ws = null;
                 }
-                if (!event.wasClean && pendingToken) {
-                    onError(new Error(`WebSocket closed unexpectedly: ${event.code}`));
-                    reject(new Error(`WebSocket closed: ${event.code}`));
+                // Only error on abnormal close codes (not 1000/1001 which are normal)
+                // 1000 = normal closure, 1001 = going away (page unload)
+                if (event.code !== 1000 && event.code !== 1001) {
+                    const err = new Error(`WebSocket closed unexpectedly: ${event.code}`);
+                    onError(err);
+                    reject(err);
                 }
+                // Normal close after 'done' is fine - resolve() already called
             };
         });
     }

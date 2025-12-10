@@ -73,7 +73,9 @@ export class Renderer {
             const peakBrightness = sentence.peakBrightness;
             if (peakBrightness === -Infinity) continue;  // No active tokens
             
-            const sentenceKey = sentence.turn_id * 1000 + sentence.sentence_id;  // Numeric key
+            // Numeric key matching conversation.js format
+            const roleNum = { system: 0, user: 1, assistant: 2 };
+            const sentenceKey = sentence.turn_id * 1000000 + sentence.sentence_id * 10 + (roleNum[sentence.role] || 0);
             
             // Check if paragraph peak changed (affects all non-bright tokens)
             const lastPeak = this.lastParagraphPeak.get(sentenceKey);
@@ -129,7 +131,7 @@ export class Renderer {
      */
     addToken(token, conversation) {
         this._ensureTurnElement(token.turn_id, token.role);
-        const sentenceEl = this._ensureSentenceElement(token.turn_id, token.sentence_id);
+        const sentenceEl = this._ensureSentenceElement(token.turn_id, token.sentence_id, token.role);
         
         const span = document.createElement('span');
         span.className = 'token';
@@ -197,8 +199,9 @@ export class Renderer {
     /**
      * Ensure sentence container exists within turn
      */
-    _ensureSentenceElement(turnId, sentenceId) {
-        const key = `${turnId}:${sentenceId}`;
+    _ensureSentenceElement(turnId, sentenceId, role = 'assistant') {
+        const roleNum = { system: 0, user: 1, assistant: 2 };
+        const key = turnId * 1000000 + sentenceId * 10 + (roleNum[role] || 0);
         if (this.sentenceElements.has(key)) {
             return this.sentenceElements.get(key);
         }
@@ -229,7 +232,7 @@ export class Renderer {
         if (!turnEl) return;
         
         // Create sentence container
-        const sentenceEl = this._ensureSentenceElement(sentence.turn_id, sentence.sentence_id);
+        const sentenceEl = this._ensureSentenceElement(sentence.turn_id, sentence.sentence_id, sentence.role);
         if (!sentenceEl) return;
         
         if (sentence.deleted) {

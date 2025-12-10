@@ -585,6 +585,8 @@ const floats = new Float32Array(event.data);  // [context_length]
 - [ ] Add visual settings (font size, color scheme)
 - [ ] Manual token deletion (click to prune)
 - [ ] Undo pruning (manual resurrection from semantic index)
+- [ ] **Pin chunks** - Mark chunks as immune to pruning
+- [ ] **Merge chunks** - Combine two adjacent chunks (update sentence_ids, re-embed)
 
 **Medium Term:**
 - [ ] Multiple conversation tabs
