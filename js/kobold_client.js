@@ -64,10 +64,11 @@ export class KoboldClient {
         
         try {
             console.log('🔤 tokenize() starting...');
+            // Use text/plain to avoid CORS preflight (server still parses as JSON)
             const response = await fetch(`${this.baseUrl}/api/v1/tokenize`, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'text/plain'
                 },
                 body: JSON.stringify({
                     text: text,
