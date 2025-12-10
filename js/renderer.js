@@ -211,6 +211,11 @@ export class Renderer {
         span.dataset.turnId = turnId;
         span.dataset.sentenceId = sentenceId;
         
+        // Add chunk separator for all but first chunk in turn
+        if (sentenceId > 0) {
+            span.classList.add('chunk-boundary');
+        }
+        
         turnEl.appendChild(span);
         this.sentenceElements.set(key, span);
         return span;

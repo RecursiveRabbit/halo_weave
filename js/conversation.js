@@ -30,10 +30,13 @@ export class Conversation {
         // Sentence tracking within current turn
         this.currentSentenceId = 0;
         
-        // Short line merging: track tokens in current line
-        // Lines under minLineTokens merge forward into next line
-        this.currentLineTokenCount = 0;
-        this.minLineTokens = 10;  // Configurable threshold
+        // Paragraph-based chunking state
+        // Chunks on: \n\n (paragraph), ^} (code block end), ^``` (fenced code end)
+        // But only if chunk has >= minChunkTokens
+        this._recentText = '';  // Rolling buffer for boundary detection
+        this._inCodeBlock = false;  // Track if inside ``` fenced block
+        this._currentChunkTokens = 0;  // Tokens in current chunk
+        this.minChunkTokens = 64;  // Minimum tokens before allowing chunk break
         
         // === OPTIMIZATION: Cached active token list ===
         // Invalidated on add/delete, rebuilt lazily
@@ -100,29 +103,53 @@ export class Conversation {
     }
 
     /**
-     * Detect chunk boundaries with short line merging
+     * Detect chunk boundaries based on semantic structure
      * 
-     * Lines under minLineTokens (default 10) merge forward into the next line.
-     * This keeps semantic units together (e.g., "Groceries:" + "- Milk" + "- Eggs").
+     * Chunks on:
+     * - \n\n (paragraph break)
+     * - ^} (closing brace at line start - end of code block)
+     * - ^``` (fenced code block boundary)
      * 
-     * A chunk boundary only occurs when:
-     * 1. A newline is encountered, AND
-     * 2. The line that just ended has >= minLineTokens tokens
+     * But only if the current chunk has >= minChunkTokens (default 30).
+     * This prevents tiny chunks from short lists or headers.
      */
     _updateSentenceBoundary(text) {
-        // Count this token toward current line
-        this.currentLineTokenCount++;
+        // Count token toward current chunk
+        this._currentChunkTokens++;
         
-        if (text.includes('\n')) {
-            // Line ended - check if it's long enough to be its own chunk
-            if (this.currentLineTokenCount >= this.minLineTokens) {
-                // Long line: create chunk boundary
-                this.currentSentenceId++;
-            }
-            // Short line: no boundary, tokens merge into next line's chunk
-            
-            // Reset for next line
-            this.currentLineTokenCount = 0;
+        // Append to rolling buffer (keep last 10 chars for pattern detection)
+        this._recentText += text;
+        if (this._recentText.length > 10) {
+            this._recentText = this._recentText.slice(-10);
+        }
+        
+        // Check for chunk boundaries
+        let boundaryDetected = false;
+        
+        // 1. Paragraph break: \n\n
+        if (this._recentText.includes('\n\n')) {
+            boundaryDetected = true;
+        }
+        
+        // 2. Fenced code block boundary: ``` at start of line
+        // Match \n``` pattern
+        if (this._recentText.includes('\n```')) {
+            boundaryDetected = true;
+            this._inCodeBlock = !this._inCodeBlock;
+        }
+        
+        // 3. Code block end: } at start of line (not inside fenced block)
+        // Match \n} pattern
+        if (!this._inCodeBlock && this._recentText.includes('\n}')) {
+            boundaryDetected = true;
+        }
+        
+        // Only break if we have enough tokens in this chunk
+        if (boundaryDetected && this._currentChunkTokens >= this.minChunkTokens) {
+            this.currentSentenceId++;
+            this._currentChunkTokens = 0;
+            // Clear buffer to avoid double-triggering
+            this._recentText = '';
         }
     }
 
@@ -132,7 +159,9 @@ export class Conversation {
     nextTurn() {
         this.currentTurnId++;
         this.currentSentenceId = 0;
-        this.currentLineTokenCount = 0;
+        this._recentText = '';
+        this._inCodeBlock = false;
+        this._currentChunkTokens = 0;
     }
 
     /**
@@ -538,7 +567,9 @@ export class Conversation {
         this.currentTurnId = 0;
         this.currentRole = null;
         this.currentSentenceId = 0;
-        this.currentLineTokenCount = 0;
+        this._recentText = '';
+        this._inCodeBlock = false;
+        this._currentChunkTokens = 0;
         this._activeTokensCache = null;
         this._activeTokenCount = 0;
     }

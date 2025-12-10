@@ -9,7 +9,7 @@
 
 Halo Weave is a **pure frontend application** for visualizing transformer attention patterns and performing brightness-based context pruning with semantic resurrection. It connects directly to a modified KoboldCPP server via WebSocket for real-time attention streaming.
 
-**Status:** ✅ **PRODUCTION-READY** - Real-time attention visualization + semantic context resurrection.
+**Status:** Data Science and Endless Testing. 
 
 ---
 
@@ -88,7 +88,7 @@ Conversation.pruneToFit() - delete lowest brightness chunks
   position: 42,            // Birth position, never changes
   brightness: 255,         // Magnitude voting score (starts at 255, can go negative)
   turn_id: 2,
-  sentence_id: 0,          // Chunk ID - increments on newlines when line ≥10 tokens
+  sentence_id: 0,          // Chunk ID - increments on paragraph/code boundaries (min 64 tokens)
   role: "user",            // "system", "user", or "assistant"
   deleted: false,          // Soft-delete flag
   brightness_at_deletion: undefined  // Preserved when deleted for debugging
@@ -226,24 +226,25 @@ Back in active context, must prove itself again
 **Token budget:** `resurrectionBudget - estimatedUserTokens` (default 512)
 **Lookup:** By `(turn_id, sentence_id, role)` tuple, not token positions
 
-### 6. Short Line Merging (conversation.js)
+### 6. Paragraph-Based Chunking (conversation.js)
 
-**Chunks are semantic units, not raw lines.** Lines under 10 tokens merge forward.
+**Chunks are semantic units: paragraphs and code blocks, with a minimum size.**
 
-**Example:**
-```
-"Groceries:"        (2 tokens)  → merge forward
-"- Milk"            (3 tokens)  → merge forward
-"- Eggs"            (3 tokens)  → merge forward
-"Get these today."  (4 tokens)  → merge forward
-"I'll pick them up after work." (14 tokens) → STOP, create chunk boundary
-```
+**Chunk boundaries occur at:**
+1. `\n\n` - Paragraph break (double newline)
+2. `\n}` - Closing brace at line start (code block end)
+3. `\n``` ` - Fenced code block boundary
 
-All tokens from "Groceries:" through the 14-token line share the same `sentence_id`.
+**But only if** the current chunk has ≥64 tokens (`minChunkTokens`).
 
-**Implementation:** `sentence_id` only increments when:
-1. A newline is encountered, AND
-2. The completed line has ≥ `minLineTokens` (default 10) tokens
+Short paragraphs, lists, and headers merge into the next chunk until the minimum is reached.
+
+**Why this approach:**
+- Paragraphs are natural semantic units
+- Code blocks stay intact
+- Minimum size prevents tiny chunks (e.g., "## Header" becoming its own chunk)
+- Fewer, larger chunks = faster indexing + better recall
+- 256-token embedding limit just truncates long chunks (topic still captured)
 
 ---
 
@@ -254,7 +255,7 @@ All tokens from "Groceries:" through the 14-token line share the same `sentence_
 **DO:**
 - ✅ Maintain position uniqueness
 - ✅ Preserve deleted tokens in array (soft-delete)
-- ✅ Update line tracking incrementally (newlines only)
+- ✅ Update chunk tracking on paragraph/code boundaries
 - ✅ Keep fail-bright principle (new tokens = 255)
 
 **DON'T:**
@@ -574,7 +575,7 @@ const floats = new Float32Array(event.data);  // [context_length]
 
 ### Bugs to Investigate
 
-- [ ] **Firefox connection issues** - Intermittent WebSocket/HTTP connection problems in Firefox. Works fine in Chrome/Brave. Root cause unknown.
+- [ ] **Stale state after refresh** - Occasionally, old conversation content persists after page refresh. Hard refresh (Ctrl+Shift+R) clears it. May be browser caching JS files.
 - [ ] **End token tokenization hanging** - `<|im_end|>` tokenization after generation sometimes hangs. Currently commented out in app.js.
 
 ### Future Improvements
@@ -586,7 +587,7 @@ const floats = new Float32Array(event.data);  // [context_length]
 
 **Medium Term:**
 - [ ] Multiple conversation tabs
-- [ ] Web Workers for semantic index embedding (off main thread)
+- [x] Web Workers for semantic index embedding (off main thread) ✅ Implemented
 - [ ] Attention pattern analysis (which tokens attended to which)
 
 **Long Term:**

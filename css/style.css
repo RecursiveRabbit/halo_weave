@@ -221,6 +221,14 @@ body {
     opacity: 0.3;
 }
 
+/* Chunk boundary - visual separator between semantic chunks */
+.sentence.chunk-boundary {
+    display: block;
+    border-top: 1px dashed rgba(255, 200, 0, 0.4);
+    margin-top: 4px;
+    padding-top: 4px;
+}
+
 /* Token spans - grayscale to white based on brightness */
 .token {
     /* Color set dynamically via inline style */
