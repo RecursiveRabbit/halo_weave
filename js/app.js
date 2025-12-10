@@ -75,6 +75,11 @@ class App {
         
         this._loadSettings();
         this._updateStats();
+        
+        // Preload embedding model in background (avoids lag on first message)
+        this.semanticIndex.preloadModel().catch(err => {
+            console.warn('Embedding model preload failed:', err);
+        });
     }
 
     _bindEvents() {
@@ -179,8 +184,14 @@ class App {
         const estimatedUserTokens = Math.ceil(userText.length / 4);
         const tokenBudget = Math.max(0, this.resurrectionBudget - estimatedUserTokens);
         
+        const idxStats = this.semanticIndex.getStats();
+        console.log(`\n📚 RESURRECTION QUERY`);
+        console.log(`   Index size: ${idxStats.entries} chunks (${idxStats.embedded} embedded)`);
+        console.log(`   Query: "${userText.substring(0, 60)}${userText.length > 60 ? '...' : ''}"`);
+        console.log(`   Token budget: ${tokenBudget}`);
+        
         if (tokenBudget <= 0) {
-            console.log('📚 No resurrection budget (user message too long)');
+            console.log(`   Result: No budget (user message too long)`);
             return;
         }
         
@@ -191,15 +202,21 @@ class App {
         });
         
         if (matches.length === 0) {
-            console.log('📚 No relevant context in semantic index');
+            console.log(`   Result: No matches found`);
             return;
         }
         
+        console.log(`   Matches: ${matches.length} chunks found`);
+        
         // Resurrect each matching chunk (only if currently dead)
         let totalResurrected = 0;
+        const resurrectedChunks = [];
+        const skippedAlive = [];
+        
         for (const match of matches) {
             // Skip if chunk is already alive
             if (this.conversation.isChunkAlive(match.turn_id, match.sentence_id, match.role)) {
+                skippedAlive.push(match);
                 continue;
             }
             
@@ -213,15 +230,26 @@ class App {
                 // Mark as referenced in index (for stats/pruning priority)
                 this.semanticIndex.markReferenced(match.turn_id, match.sentence_id, match.role);
                 totalResurrected += count;
-                console.log(`📚 Resurrected ${count} tokens: "${match.text.substring(0, 50)}..." (similarity: ${match.similarity.toFixed(3)})`);
+                resurrectedChunks.push({ match, count });
             }
         }
         
-        if (totalResurrected > 0) {
+        // Log results
+        if (skippedAlive.length > 0) {
+            console.log(`   Skipped (already alive): ${skippedAlive.length} chunks`);
+        }
+        
+        if (resurrectedChunks.length > 0) {
+            console.log(`   ✨ RESURRECTED ${resurrectedChunks.length} chunks (${totalResurrected} tokens):`);
+            for (const { match, count } of resurrectedChunks) {
+                console.log(`      [turn ${match.turn_id}] "${match.text.substring(0, 50)}${match.text.length > 50 ? '...' : ''}" (${count} tok, sim=${match.similarity.toFixed(3)})`);
+            }
+            
             // Rebuild UI to show resurrected tokens
             this.renderer.rebuild(this.conversation);
             this._updateStats();
-            console.log(`📚 Total resurrected: ${totalResurrected} tokens from semantic index`);
+        } else {
+            console.log(`   Result: No dead chunks to resurrect`);
         }
     }
 
@@ -438,13 +466,23 @@ class App {
         const maxContext = parseInt(this.elements.maxContext.value);
         if (maxContext <= 0) return;  // Pruning disabled
         
+        const beforeCount = this.conversation.getActiveTokenCount();
         const prunedSentences = this.conversation.pruneToFit(maxContext);
+        
         if (prunedSentences.length > 0) {
             this.totalPruned += prunedSentences.length;
             this.renderer.rebuild(this.conversation);
             
-            // No need to add to semantic index - chunks are already indexed on creation
-            console.log(`Pruned ${prunedSentences.length} chunks to fit budget`);
+            const afterCount = this.conversation.getActiveTokenCount();
+            console.log(`\n🗑️ PRUNING REPORT`);
+            console.log(`   Budget: ${maxContext} tokens`);
+            console.log(`   Before: ${beforeCount} tokens`);
+            console.log(`   After: ${afterCount} tokens`);
+            console.log(`   Pruned ${prunedSentences.length} chunks:`);
+            for (const sentence of prunedSentences) {
+                const text = this.conversation.reconstructText(sentence.tokens);
+                console.log(`      [turn ${sentence.turn_id}] "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}" (${sentence.tokens.length} tok, peak=${sentence.peakBrightness})`);
+            }
         }
     }
 

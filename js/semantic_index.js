@@ -9,9 +9,11 @@
  * 
  * The semantic index enables resurrection of pruned content when it becomes
  * semantically relevant to new user queries.
+ * 
+ * Uses a Web Worker for embedding computation to avoid blocking the UI.
  */
 
-// Will be loaded lazily on first embed
+// Fallback: main-thread model (used if worker fails)
 let embeddingModel = null;
 
 export class SemanticIndex {
@@ -47,14 +49,96 @@ export class SemanticIndex {
         
         // Track which chunks are already indexed (by key)
         this._indexedChunks = new Set();
+        
+        // Embedding queue for sequential processing
+        this._embedQueue = [];
+        this._embedProcessing = false;
+        
+        // Web Worker for off-thread embedding
+        this._worker = null;
+        this._workerReady = false;
+        this._workerPending = new Map();  // id -> {resolve, reject}
+        this._nextEmbedId = 0;
+        
+        // Try to initialize worker
+        this._initWorker();
+    }
+    
+    /**
+     * Initialize the embedding Web Worker
+     */
+    _initWorker() {
+        try {
+            // Get the base URL for the worker script
+            const scriptUrl = new URL('./embedding_worker.js', import.meta.url);
+            this._worker = new Worker(scriptUrl, { type: 'module' });
+            
+            this._worker.onmessage = (event) => {
+                const { type, id, embedding, elapsed, error } = event.data;
+                
+                switch (type) {
+                    case 'ready':
+                        this._workerReady = true;
+                        this.modelReady = true;
+                        console.log('📚 SemanticIndex: Embedding worker ready');
+                        break;
+                        
+                    case 'embedding':
+                        const pending = this._workerPending.get(id);
+                        if (pending) {
+                            this._workerPending.delete(id);
+                            this._timing.lastEmbedMs = elapsed;
+                            this._timing.totalEmbedMs += elapsed;
+                            this._timing.embedCount++;
+                            pending.resolve(embedding);
+                        }
+                        break;
+                        
+                    case 'error':
+                        console.warn('📚 Worker error:', error);
+                        if (id !== undefined) {
+                            const p = this._workerPending.get(id);
+                            if (p) {
+                                this._workerPending.delete(id);
+                                p.reject(new Error(error));
+                            }
+                        }
+                        break;
+                }
+            };
+            
+            this._worker.onerror = (err) => {
+                console.warn('📚 Worker failed, falling back to main thread:', err.message);
+                this._worker = null;
+            };
+            
+        } catch (err) {
+            console.warn('📚 Could not create worker, using main thread:', err.message);
+            this._worker = null;
+        }
     }
 
     // ========== Embedding Pipeline ==========
 
     /**
      * Initialize the embedding model (lazy load on first use)
+     * Falls back to main thread if worker is not available
      */
     async _ensureModel() {
+        // If worker is ready, we're good
+        if (this._workerReady) return true;
+        
+        // If worker exists but not ready, wait for it
+        if (this._worker && !this._workerReady) {
+            // Wait up to 30s for worker to be ready
+            for (let i = 0; i < 300; i++) {
+                await new Promise(r => setTimeout(r, 100));
+                if (this._workerReady) return true;
+                if (!this._worker) break;  // Worker failed
+            }
+        }
+        
+        // Fallback to main thread
         if (this.modelReady) return true;
         if (this.modelError) throw this.modelError;
         if (this.modelLoading) {
@@ -66,7 +150,7 @@ export class SemanticIndex {
         }
 
         this.modelLoading = true;
-        console.log('📚 SemanticIndex: Loading embedding model...');
+        console.log('📚 SemanticIndex: Loading embedding model (main thread fallback)...');
         
         try {
             const { pipeline: createPipeline } = await import(
@@ -80,7 +164,7 @@ export class SemanticIndex {
             );
             
             this.modelReady = true;
-            console.log('📚 SemanticIndex: Embedding model ready');
+            console.log('📚 SemanticIndex: Embedding model ready (main thread)');
             return true;
             
         } catch (err) {
@@ -94,10 +178,17 @@ export class SemanticIndex {
 
     /**
      * Embed text into a vector
+     * Uses worker if available, falls back to main thread
      * @param {string} text - Text to embed
      * @returns {Promise<Float32Array>} - 384-dimensional embedding
      */
     async embed(text) {
+        // Try worker first
+        if (this._workerReady && this._worker) {
+            return this._embedViaWorker(text);
+        }
+        
+        // Fallback to main thread
         await this._ensureModel();
         
         const t0 = performance.now();
@@ -113,6 +204,17 @@ export class SemanticIndex {
         this._timing.embedCount++;
         
         return new Float32Array(output.data);
+    }
+    
+    /**
+     * Embed via Web Worker (off main thread)
+     */
+    _embedViaWorker(text) {
+        return new Promise((resolve, reject) => {
+            const id = this._nextEmbedId++;
+            this._workerPending.set(id, { resolve, reject });
+            this._worker.postMessage({ type: 'embed', id, text });
+        });
     }
 
     // ========== Chunk Key Utilities ==========
@@ -181,10 +283,8 @@ export class SemanticIndex {
             this._indexedChunks.add(key);
             this.totalIndexed++;
             
-            // Compute embedding async (don't block)
-            this._computeEmbedding(entry, contextText).catch(err => {
-                console.warn('📚 Failed to embed chunk:', err);
-            });
+            // Queue embedding (processed sequentially to avoid WASM contention)
+            this._queueEmbedding(entry, contextText);
         }
     }
 
@@ -235,14 +335,30 @@ export class SemanticIndex {
     }
 
     /**
-     * Compute embedding for an entry
+     * Queue embedding computation (processed sequentially to avoid overwhelming WASM)
      */
-    async _computeEmbedding(entry, contextText) {
-        try {
-            entry.embedding = await this.embed(contextText);
-        } catch (err) {
-            console.warn('📚 Embedding failed for entry:', entry.text.substring(0, 30));
+    _queueEmbedding(entry, contextText) {
+        this._embedQueue.push({ entry, contextText });
+        this._processEmbedQueue();
+    }
+    
+    /**
+     * Process embedding queue sequentially
+     */
+    async _processEmbedQueue() {
+        if (this._embedProcessing) return;
+        this._embedProcessing = true;
+        
+        while (this._embedQueue.length > 0) {
+            const { entry, contextText } = this._embedQueue.shift();
+            try {
+                entry.embedding = await this.embed(contextText);
+            } catch (err) {
+                console.warn('📚 Embedding failed for entry:', entry.text.substring(0, 30));
+            }
         }
+        
+        this._embedProcessing = false;
     }
 
     /**
