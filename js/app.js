@@ -27,7 +27,6 @@ class App {
         this.isGenerating = false;
         this.generationStep = 0;
         this.totalPruned = 0;
-        this.resurrectionBudget = 512;  // Max tokens to resurrect per user message
         this._statsPending = false;  // Coalesce stats updates with rAF
         
         // DOM elements
@@ -178,17 +177,33 @@ class App {
      * @param {string} userText - The user's message text
      */
     async _resurrectRelevantContext(userText) {
-        // Calculate token budget for resurrection
-        // Budget = resurrectionBudget - estimated user message tokens
-        // Rough estimate: 4 chars per token
-        const estimatedUserTokens = Math.ceil(userText.length / 4);
-        const tokenBudget = Math.max(0, this.resurrectionBudget - estimatedUserTokens);
+        // Calculate available space dynamically:
+        // availableSpace = maxContext - currentTokens - maxNewTokens - userMessageTokens
+        // Use model's actual context limit, fall back to fixed 512 budget
+        const modelMaxContext = this.client.modelInfo?.max_context_length;
+        const estimatedUserTokens = Math.ceil(userText.length / 4);  // Rough estimate
+        
+        let tokenBudget;
+        if (modelMaxContext) {
+            const maxNewTokens = parseInt(this.elements.maxTokens.value);
+            const currentTokens = this.conversation.getActiveTokenCount();
+            tokenBudget = Math.max(0, modelMaxContext - currentTokens - maxNewTokens - estimatedUserTokens);
+        } else {
+            // Fallback: fixed budget minus user message
+            tokenBudget = Math.max(0, 512 - estimatedUserTokens);
+        }
         
         const idxStats = this.semanticIndex.getStats();
         console.log(`\n📚 RESURRECTION QUERY`);
         console.log(`   Index size: ${idxStats.entries} chunks (${idxStats.embedded} embedded)`);
         console.log(`   Query: "${userText.substring(0, 60)}${userText.length > 60 ? '...' : ''}"`);
-        console.log(`   Token budget: ${tokenBudget}`);
+        if (modelMaxContext) {
+            const maxNewTokens = parseInt(this.elements.maxTokens.value);
+            const currentTokens = this.conversation.getActiveTokenCount();
+            console.log(`   Space calc: ${modelMaxContext} max - ${currentTokens} current - ${maxNewTokens} gen - ${estimatedUserTokens} user = ${tokenBudget} available`);
+        } else {
+            console.log(`   Token budget: ${tokenBudget} (fallback mode)`);
+        }
         
         if (tokenBudget <= 0) {
             console.log(`   Result: No budget (user message too long)`);

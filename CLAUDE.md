@@ -577,6 +577,7 @@ const floats = new Float32Array(event.data);  // [context_length]
 
 - [ ] **Stale state after refresh** - Occasionally, old conversation content persists after page refresh. Hard refresh (Ctrl+Shift+R) clears it. May be browser caching JS files.
 - [ ] **End token tokenization hanging** - `<|im_end|>` tokenization after generation sometimes hangs. Currently commented out in app.js.
+- [ ] **Off-by-one on assistant turns** - AI sometimes answers the previous question instead of the current one. Likely a turn boundary or resurrection timing issue.
 
 ### Future Improvements
 
