@@ -84,7 +84,8 @@ export class Conversation {
             turn_id: this.currentTurnId,
             role: this.currentRole,
             sentence_id: sentenceId,
-            deleted: false
+            deleted: false,
+            pinned: false
         };
         
         this.tokens.push(token);
@@ -351,6 +352,9 @@ export class Conversation {
                 // Skip system prompt (turn_id 0, role system) - never prune
                 if (s.turn_id === 0 && s.role === 'system') continue;
                 
+                // Skip pinned sentences
+                if (s.pinned) continue;
+                
                 prunableSentenceCount++;
                 
                 if (s.peakBrightness < lowestPeak) {
@@ -425,6 +429,50 @@ export class Conversation {
     }
     
     /**
+     * Toggle pinned state for all tokens in a sentence
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence/chunk ID
+     * @param {string} role - Role
+     * @returns {boolean} New pinned state
+     */
+    togglePinned(turn_id, sentence_id, role) {
+        // First, determine current state (pinned if ANY token is pinned)
+        let currentlyPinned = false;
+        for (const token of this.tokens) {
+            if (token.turn_id === turn_id && 
+                token.sentence_id === sentence_id && 
+                token.role === role &&
+                token.pinned) {
+                currentlyPinned = true;
+                break;
+            }
+        }
+        
+        // Toggle all tokens in this sentence
+        const newState = !currentlyPinned;
+        let resurrected = false;
+        for (const token of this.tokens) {
+            if (token.turn_id === turn_id && 
+                token.sentence_id === sentence_id && 
+                token.role === role) {
+                token.pinned = newState;
+                // Pinning also resurrects deleted tokens
+                if (newState && token.deleted) {
+                    token.deleted = false;
+                    token.brightness = 255;
+                    resurrected = true;
+                }
+            }
+        }
+        
+        if (resurrected) {
+            this._invalidateCache();
+        }
+        
+        return newState;
+    }
+    
+    /**
      * Check if a chunk is currently alive (not deleted)
      * @param {number} turn_id - Turn ID
      * @param {number} sentence_id - Sentence/chunk ID  
@@ -485,12 +533,18 @@ export class Conversation {
                     tokens: [],
                     peakBrightness: -Infinity,
                     peakBrightnessAtDeletion: null,
-                    fullyDeleted: true
+                    fullyDeleted: true,
+                    pinned: false
                 };
                 sentenceMap.set(key, sentence);
             }
             
             sentence.tokens.push(token);
+            
+            // Sentence is pinned if ANY token is pinned
+            if (token.pinned) {
+                sentence.pinned = true;
+            }
             
             if (!token.deleted) {
                 sentence.fullyDeleted = false;

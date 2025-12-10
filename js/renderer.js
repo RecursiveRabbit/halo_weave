@@ -18,6 +18,7 @@ export class Renderer {
         this.lastBrightness = new Map();    // position -> last rendered brightness
         this.lastParagraphPeak = new Map(); // "turn_id:sentence_id" -> last peak brightness
         this.pendingUpdate = false;         // Coalesce updates with rAF
+        this.onPinToggle = null;            // Callback: (turnId, sentenceId, role) => newPinnedState
     }
 
     /**
@@ -213,11 +214,30 @@ export class Renderer {
         span.className = 'sentence';
         span.dataset.turnId = turnId;
         span.dataset.sentenceId = sentenceId;
+        span.dataset.role = role;
         
         // Add chunk separator for all but first chunk in turn
         if (sentenceId > 0) {
             span.classList.add('chunk-boundary');
         }
+        
+        // Add pin button
+        const pinBtn = document.createElement('button');
+        pinBtn.className = 'pin-btn';
+        pinBtn.textContent = '📌';
+        pinBtn.title = 'Pin/unpin this chunk (immune to pruning)';
+        pinBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (this.onPinToggle) {
+                const isPinned = this.onPinToggle(
+                    parseInt(span.dataset.turnId),
+                    parseInt(span.dataset.sentenceId),
+                    span.dataset.role
+                );
+                span.classList.toggle('pinned', isPinned);
+            }
+        });
+        span.appendChild(pinBtn);
         
         turnEl.appendChild(span);
         this.sentenceElements.set(key, span);
@@ -238,6 +258,9 @@ export class Renderer {
         if (sentence.deleted) {
             sentenceEl.classList.add('deleted');
         }
+        
+        // Set pinned state
+        sentenceEl.classList.toggle('pinned', sentence.pinned);
         
         // Use peakBrightness already computed by getSentences()
         const peakBrightness = sentence.peakBrightness !== -Infinity ? sentence.peakBrightness : 255;

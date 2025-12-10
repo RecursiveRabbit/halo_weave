@@ -23,6 +23,15 @@ class App {
         this.capture = new DataCapture();
         this.semanticIndex = new SemanticIndex();
         
+        // Wire up renderer callbacks
+        this.renderer.onPinToggle = (turnId, sentenceId, role) => {
+            const isPinned = this.conversation.togglePinned(turnId, sentenceId, role);
+            // Rebuild to reflect resurrection/deletion state changes
+            this.renderer.rebuild(this.conversation);
+            this._updateStats();
+            return isPinned;
+        };
+        
         // State
         this.isGenerating = false;
         this.generationStep = 0;
