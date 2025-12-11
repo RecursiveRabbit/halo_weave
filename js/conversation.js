@@ -285,6 +285,8 @@ export class Conversation {
             if (att > threshold) {
                 // Strong reference: +ratio (e.g., 6.5x threshold → +6)
                 token.brightness += (att / threshold) | 0;  // Faster than Math.floor
+                // Cap at 10000 to prevent immortal tokens
+                if (token.brightness > 10000) token.brightness = 10000;
             } else {
                 // Weak/no reference: gentle decay
                 token.brightness -= 1;
@@ -388,7 +390,8 @@ export class Conversation {
         for (const token of this.tokens) {
             if (positionSet.has(token.position) && token.deleted) {
                 token.deleted = false;
-                token.brightness = 255;  // Fresh start
+                // Keep earned brightness if higher than floor
+                token.brightness = Math.max(255, token.brightness_at_deletion || 255);
                 resurrectedCount++;
             }
         }
@@ -416,7 +419,8 @@ export class Conversation {
                 token.role === role &&
                 token.deleted) {
                 token.deleted = false;
-                token.brightness = 255;  // Fresh start
+                // Keep earned brightness if higher than floor
+                token.brightness = Math.max(255, token.brightness_at_deletion || 255);
                 resurrectedCount++;
             }
         }
@@ -459,7 +463,8 @@ export class Conversation {
                 // Pinning also resurrects deleted tokens
                 if (newState && token.deleted) {
                     token.deleted = false;
-                    token.brightness = 255;
+                    // Keep earned brightness if higher than floor
+                    token.brightness = Math.max(255, token.brightness_at_deletion || 255);
                     resurrected = true;
                 }
             }
@@ -507,18 +512,29 @@ export class Conversation {
         
         let mergedCount = 0;
         
+        // Resurrect all tokens in target sentence (in case it was deleted)
+        for (const token of this.tokens) {
+            if (token.turn_id === turn_id && 
+                token.sentence_id === targetSentenceId && 
+                token.role === role) {
+                token.deleted = false;
+            }
+        }
+        
+        // Move source tokens to target and resurrect them
         for (const token of this.tokens) {
             if (token.turn_id === turn_id && 
                 token.sentence_id === sentence_id && 
                 token.role === role) {
                 token.sentence_id = targetSentenceId;
+                token.deleted = false;
                 mergedCount++;
             }
         }
         
         if (mergedCount > 0) {
             this._invalidateCache();
-            console.log(`Merged ${mergedCount} tokens from sentence ${sentence_id} into ${targetSentenceId}`);
+            console.log(`Merged ${mergedCount} tokens from sentence ${sentence_id} into ${targetSentenceId} (all resurrected)`);
         }
         
         return { success: mergedCount > 0, targetSentenceId };
