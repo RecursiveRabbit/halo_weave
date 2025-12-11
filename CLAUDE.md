@@ -1,5 +1,28 @@
 # CLAUDE.md - Halo Weave Development Guide
 
+Okay, so the problem is context length. 
+Any conversation will eventually grow too large and overwhelm the context window. 
+Solutions: 
+FIFO or sliding window: Delete the oldest context as new context is generated.
+> This is bad because it deletes tokens regardless of importance and the earliest tokens in a conversation are, like these tokens, critical to understanding the tokens that come afterwards. 
+Summarization: Occasionally grab the whole context, or a section of the context, and have the system generate a summary of that context. 
+> This sucks.The model rewords everything and you end up with a completely broken understanding of what's going on, losing anything important that you might have written. You lose direct user quotes and precise data in favor of rumors of what that data might have been. 
+
+You need a way to delete unimportant information, while preserving important context. 
+My proposed solution: Brightness based culling. 
+We harness the attention calculation that the model is already doing on the forward pass, using those scores over time to give each token a "brightness" score. 
+You then clear whole chunks with low peak brightness from the context. 
+Low peak brightness is important because a single bright token can keep a whole chunk afloat. 
+We allow the model itself to determine what data is important and what is not and we clear out what isn't. 
+
+But what if a user mentions something in turn 1 that doesn't become important until turn 80? 
+That's where the Semantic Index comes into play.
+We don't actually delete any tokens, we just set deleted=true and stop rendering them.
+As content is generated and added it's added to the Semantic Index, a RAG database that we query on subsequent user turns.
+When a sequence is returned via RAG we don't stick it at the end of the context, we just set deleted=false and the sentence appears in the context at the appropriate depth as if it was never deleted.
+The Chekhov's gun from turn 1 reappears in turn 1 when it becomes relevant in turn 80.
+A resurrected chunk is treated as new context, with a default brightness score, and must then either prove itself or be deleted again on subsequent turns. 
+
 **For:** AI assistants working on this project
 **Last Verified Against Code:** 2025-12-09
 
@@ -86,7 +109,7 @@ Conversation.pruneToFit() - delete lowest brightness chunks
   token_id: 9707,
   text: "Hello",
   position: 42,            // Birth position, never changes
-  brightness: 255,         // Magnitude voting score (starts at 255, can go negative)
+  brightness: 255,         // Magnitude voting score (starts at 255, capped at 10000)
   turn_id: 2,
   sentence_id: 0,          // Chunk ID - increments on paragraph/code boundaries (min 64 tokens)
   role: "user",            // "system", "user", or "assistant"
@@ -100,7 +123,8 @@ Conversation.pruneToFit() - delete lowest brightness chunks
 - Tokenize once when message added, never retokenize
 - Soft-delete: deleted tokens stay in array, marked `deleted=true`
 - Fail bright: new tokens start at `brightness=255`
-- Scores can go negative (no clamping)
+- Scores capped at 10000 to prevent immortal tokens
+- Resurrection preserves earned brightness: `max(255, brightness_at_deletion)`
 
 ### 2. Brightness Scoring (Magnitude Voting v3)
 
@@ -113,10 +137,10 @@ Pre-aggregated attention [context_length] (server computes mean across layers/he
 Calculate threshold: (1.0 - bos_attention) / (context_len - 1)
   ↓
 For each token where i > 0 (skip BOS) and turn_id !== currentTurnId:
-  - If attention > threshold: brightness += int(attention / threshold)
-  - If attention <= threshold: brightness -= 1
+  - If attention > threshold: brightness += int(attention / threshold), cap at 10000
+  - If attention <= threshold: brightness -= max(1, brightness * 0.01)  // 1% decay
   ↓
-No clamping - scores range freely (can go negative)
+Proportional decay prevents ceiling pile-up (high-brightness tokens decay faster)
 ```
 
 **Key insights:**

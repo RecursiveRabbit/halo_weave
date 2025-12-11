@@ -285,11 +285,12 @@ export class Conversation {
             if (att > threshold) {
                 // Strong reference: +ratio (e.g., 6.5x threshold → +6)
                 token.brightness += (att / threshold) | 0;  // Faster than Math.floor
-                // Cap at 10000 to prevent immortal tokens
+                // Cap at 10000 to prevent runaway scores
                 if (token.brightness > 10000) token.brightness = 10000;
             } else {
-                // Weak/no reference: gentle decay
-                token.brightness -= 1;
+                // Weak/no reference: 1% decay (proportional, not flat)
+                // High-brightness tokens decay faster in absolute terms
+                token.brightness -= Math.max(1, (token.brightness * 0.01) | 0);
             }
         }
     }
