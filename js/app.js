@@ -93,7 +93,10 @@ class App {
         
         try {
             const modelInfo = await this.client.getModelInfo();
-            this._setStatus(`Connected: ${modelInfo.model_name || 'Unknown Model'}`, 'connected');
+            const attentionVersion = await this.client.getAttentionVersion();
+            
+            const versionLabel = attentionVersion === 2 ? ' (V2 Aggregated)' : ' (V1)';
+            this._setStatus(`Connected: ${modelInfo.model_name || 'Unknown Model'}${versionLabel}`, 'connected');
             console.log('Model info:', modelInfo);
         } catch (err) {
             this._setStatus('Connection failed - is KoboldCPP running?', 'error');
@@ -251,11 +254,44 @@ class App {
         console.log(`   Matches: ${matches.length} chunks found`);
         
         // Resurrect matching chunks until budget exhausted
+        // Paired resurrection preserves conversation structure:
+        // - User chunks bring assistant sentence 0 from next turn (the response)
+        // - Assistant chunks bring user sentence 0 from previous turn (the question)
+        // NOTE: If multiple chunks from same turn match, we may over-reserve budget
+        // for the shared pair. Not worth the complexity to fix this edge case.
         let totalResurrected = 0;
         let tokensUsed = 0;
         const resurrectedChunks = [];
         const skippedAlive = [];
         const skippedBudget = [];
+        
+        // Helper to find conversational pair from semantic index
+        const findPair = (match) => {
+            let pairTurn, pairRole;
+            if (match.role === 'user') {
+                pairTurn = match.turn_id + 1;
+                pairRole = 'assistant';
+            } else if (match.role === 'assistant') {
+                pairTurn = match.turn_id - 1;
+                pairRole = 'user';
+            } else {
+                return null; // system chunks don't pair
+            }
+            
+            // Look up pair in semantic index to get token count
+            const pairEntry = this.semanticIndex.entries.find(e => 
+                e.turn_id === pairTurn && e.sentence_id === 0 && e.role === pairRole
+            );
+            
+            if (!pairEntry) return null;
+            
+            return {
+                turn_id: pairTurn,
+                sentence_id: 0,
+                role: pairRole,
+                tokenCount: pairEntry.tokenCount
+            };
+        };
         
         for (const match of matches) {
             // Skip if chunk is already alive
@@ -264,12 +300,18 @@ class App {
                 continue;
             }
             
-            // Skip if would exceed budget
-            if (tokensUsed + match.tokenCount > tokenBudget) {
+            // Find conversational pair
+            const pair = findPair(match);
+            const pairAlive = pair && this.conversation.isChunkAlive(pair.turn_id, pair.sentence_id, pair.role);
+            const pairCost = (pair && !pairAlive) ? pair.tokenCount : 0;
+            
+            // Skip if combined cost would exceed budget
+            if (tokensUsed + match.tokenCount + pairCost > tokenBudget) {
                 skippedBudget.push(match);
                 continue;
             }
             
+            // Resurrect the matched chunk
             const count = this.conversation.resurrectByTuple(
                 match.turn_id, 
                 match.sentence_id, 
@@ -277,11 +319,29 @@ class App {
             );
             
             if (count > 0) {
-                // Mark as referenced in index (for stats/pruning priority)
                 this.semanticIndex.markReferenced(match.turn_id, match.sentence_id, match.role);
                 totalResurrected += count;
                 tokensUsed += count;
                 resurrectedChunks.push({ match, count });
+            }
+            
+            // Resurrect the pair if it exists and is dead
+            if (pair && !pairAlive) {
+                const pairCount = this.conversation.resurrectByTuple(
+                    pair.turn_id,
+                    pair.sentence_id,
+                    pair.role
+                );
+                
+                if (pairCount > 0) {
+                    this.semanticIndex.markReferenced(pair.turn_id, pair.sentence_id, pair.role);
+                    totalResurrected += pairCount;
+                    tokensUsed += pairCount;
+                    resurrectedChunks.push({ 
+                        match: { ...pair, text: '(paired)', similarity: 0 }, 
+                        count: pairCount 
+                    });
+                }
             }
         }
         
@@ -394,8 +454,11 @@ class App {
                     // Measure gap since last token (network + model inference)
                     this._timingStats.tokenGaps += t0 - this._timingStats.lastTokenTime;
                     
-                    // Skip if no valid token
-                    if (tokenId === null && !text) return;
+                    // Skip if no valid token ID (null/undefined means invalid token)
+                    if (tokenId === null || tokenId === undefined) {
+                        console.warn('Skipping token with null/undefined ID:', { tokenId, text });
+                        return;
+                    }
                     
                     // Add token to conversation
                     let t1 = performance.now();

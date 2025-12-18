@@ -14,6 +14,7 @@ export class KoboldClient {
         this.ws = null;  // Track active WebSocket for cleanup
         this.modelInfo = null;
         this.useWebSocket = true;  // Prefer WebSocket for binary streaming
+        this.attentionVersion = null;  // API version: 1 (per-layer) or 2 (aggregated)
     }
 
     /**
@@ -50,6 +51,29 @@ export class KoboldClient {
         }
         this.modelInfo = await response.json();
         return this.modelInfo;
+    }
+
+    /**
+     * Get attention API version from server
+     * @returns {Promise<number>} Version number (1 or 2)
+     */
+    async getAttentionVersion() {
+        try {
+            const response = await fetch(`${this.baseUrl}/api/extra/attention_version`);
+            if (!response.ok) {
+                console.warn('Attention version endpoint not found, assuming V1');
+                this.attentionVersion = 1;
+                return 1;
+            }
+            const data = await response.json();
+            this.attentionVersion = data.version || 1;
+            console.log(`📡 Attention API version: ${this.attentionVersion}`);
+            return this.attentionVersion;
+        } catch (err) {
+            console.warn('Failed to get attention version, assuming V1:', err);
+            this.attentionVersion = 1;
+            return 1;
+        }
     }
 
     /**
@@ -167,6 +191,7 @@ export class KoboldClient {
                     top_p: config.topP || 0.9,
                     top_k: config.topK || 40,
                     rep_pen: config.repetitionPenalty || 1.0,
+                    output_attentions: config.returnAttention !== false,
                     request_id: requestId,
                     sampler_seed: config.seed || -1
                 }));
@@ -200,15 +225,15 @@ export class KoboldClient {
                     }
                 } else {
                     // Binary frame - pre-aggregated float32 attention data
-                    // Server already computed mean(axis=(0,1)), so shape is just [contextLen]
+                    // V2 API: Server already computed mean(axis=(0,1)), so shape is just [contextLen]
                     const floats = new Float32Array(event.data);
                     const contextLen = floats.length;
                     
                     const attention = {
                         data: floats,
-                        shape: [1, 1, contextLen],  // Pretend 1 layer, 1 head for compatibility
+                        shape: [1, 1, contextLen],  // Compatibility shape
                         contextLength: contextLen,
-                        preAggregated: true  // Flag for client to skip aggregation
+                        preAggregated: true  // V2 format - skip client-side aggregation
                     };
                     
                     // Deliver token with attention
@@ -317,7 +342,7 @@ export class KoboldClient {
                                 let attention = null;
                                 if (data.attention && config.returnAttention !== false) {
                                     const t0 = performance.now();
-                                    attention = this._decodeAttention(data.attention);
+                                    attention = this._decodeAttentionSSE(data.attention);
                                     this._decodeTime = (this._decodeTime || 0) + (performance.now() - t0);
                                     this._decodeCount = (this._decodeCount || 0) + 1;
                                 }
@@ -380,11 +405,34 @@ export class KoboldClient {
     }
 
     /**
-     * Decode base64-encoded attention tensor
+     * Decode attention from SSE response (supports V1 base64 and V2 aggregated)
      * @param {Object} attentionInfo - Attention data from server
-     * @returns {Float32Array} Attention array [layers, heads, context_length]
+     * @returns {Object} Attention object with {data, shape, contextLength, preAggregated?}
      */
-    _decodeAttention(attentionInfo) {
+    _decodeAttentionSSE(attentionInfo) {
+        // V2: Aggregated format - data is already a float array
+        if (attentionInfo.format === 'aggregated') {
+            const contextLen = attentionInfo.context_length || attentionInfo.shape[0];
+            const floats = new Float32Array(attentionInfo.data);
+            
+            return {
+                data: floats,
+                shape: [1, 1, contextLen],  // Compatibility shape
+                contextLength: contextLen,
+                preAggregated: true  // Skip client-side aggregation
+            };
+        }
+        
+        // V1: Base64-encoded tensor - decode and return full tensor
+        return this._decodeAttentionV1(attentionInfo);
+    }
+
+    /**
+     * Decode V1 base64-encoded attention tensor
+     * @param {Object} attentionInfo - Attention data from server
+     * @returns {Object} Attention object with {data, shape, contextLength}
+     */
+    _decodeAttentionV1(attentionInfo) {
         // Decode base64 to binary - use native fetch for speed
         const binaryString = atob(attentionInfo.data);
         const len = binaryString.length;
@@ -410,7 +458,8 @@ export class KoboldClient {
         return {
             data: floats,
             shape: attentionInfo.shape,
-            contextLength: attentionInfo.context_length
+            contextLength: attentionInfo.context_length,
+            preAggregated: false  // Needs client-side aggregation
         };
     }
 

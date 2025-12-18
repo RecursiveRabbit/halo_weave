@@ -26,6 +26,7 @@ export class SemanticIndex {
         this.embeddingContextTokens = options.embeddingContextTokens || 256;
         this.queryMaxResults = options.queryMaxResults || 128;
         this.resurrectionBudget = options.resurrectionBudget || 1024;
+        this.userBoost = options.userBoost || 1.5;  // Boost user content in retrieval
         
         // Model loading state
         this.modelLoading = false;
@@ -405,7 +406,13 @@ export class SemanticIndex {
         for (const entry of this.entries) {
             if (!entry.embedding) continue;
             
-            const similarity = this._cosineSimilarity(queryEmbedding, entry.embedding);
+            let similarity = this._cosineSimilarity(queryEmbedding, entry.embedding);
+            
+            // Boost user content - denser signal, smaller chunks
+            if (entry.role === 'user') {
+                similarity *= this.userBoost;
+            }
+            
             scored.push({ entry, similarity });
         }
         

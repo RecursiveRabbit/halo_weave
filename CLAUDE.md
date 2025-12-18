@@ -24,7 +24,7 @@ The Chekhov's gun from turn 1 reappears in turn 1 when it becomes relevant in tu
 A resurrected chunk is treated as new context, with a default brightness score, and must then either prove itself or be deleted again on subsequent turns. 
 
 **For:** AI assistants working on this project
-**Last Verified Against Code:** 2025-12-09
+**Last Verified Against Code:** 2025-12-15
 
 ---
 
@@ -147,7 +147,8 @@ Proportional decay prevents ceiling pile-up (high-brightness tokens decay faster
 - BOS token is attention sink (up to 40% of total) - excluded from threshold calculation
 - Current turn tokens skip scoring entirely (they're in their local attention wave)
 - Magnitude captures intensity, not just frequency
-- Server-side aggregation reduces bandwidth from ~6.5MB to ~8KB per token
+- V2 API: Server-side aggregation reduces bandwidth from ~6.5MB to ~8KB per token
+- V1 API: Client-side aggregation (fallback for older servers)
 
 ### 3. Array Index ↔ Position ID Mapping
 
@@ -296,12 +297,14 @@ Short paragraphs, lists, and headers merge into the next chunk until the minimum
 - ✅ Force-close lingering WebSockets before new generation (`_forceCloseWebSocket()`)
 - ✅ Fall back to SSE if WebSocket fails
 - ✅ Use 5s timeout on tokenize requests
+- ✅ Detect API version via `/api/extra/attention_version` on startup
+- ✅ Support both V1 (base64 tensor) and V2 (aggregated array) formats
 
 **DON'T:**
 - ❌ Store conversation state (client is stateless)
 - ❌ Wait for WebSocket close handshake (can take 10s+)
 - ❌ Assume specific model (query /api/v1/model)
-- ❌ Aggregate attention client-side (server does this now)
+- ❌ Assume specific API version (detect via version endpoint)
 
 ### When Modifying renderer.js
 
@@ -530,9 +533,24 @@ window.app.client.abort()
 
 ## API Integration (KoboldCPP)
 
+### API Version Detection
+
+**Endpoint:** `GET /api/extra/attention_version`
+
+**Response:**
+```json
+{"version": 2}
+```
+
+**Versions:**
+- **V1**: Full tensor `[layers, heads, seq_len]` per token (~6.5MB base64)
+- **V2**: Aggregated `[seq_len]` per token (~8KB raw floats)
+
+Halo Weave automatically detects and adapts to the server's API version on startup.
+
 ### Required Endpoints
 
-See `KOBOLD_API_SPEC.md` for complete specification.
+See `KOBOLD_API_SPEC_V2.md` for complete V2 specification.
 
 **Model Info:**
 ```
@@ -564,7 +582,9 @@ POST /api/extra/generate/stream
 
 ### Attention Data Format
 
-**WebSocket (pre-aggregated by server):**
+**V2 API (Aggregated):**
+
+**WebSocket binary frame:**
 ```javascript
 // Binary frame is raw Float32Array
 const floats = new Float32Array(event.data);  // [context_length]
@@ -572,13 +592,26 @@ const floats = new Float32Array(event.data);  // [context_length]
 // Wrapped for conversation.js:
 {
   data: floats,
-  shape: [1, 1, contextLen],  // Pretend 1 layer, 1 head
+  shape: [1, 1, contextLen],  // Compatibility shape
   contextLength: contextLen,
-  preAggregated: true  // Flag to skip client-side aggregation
+  preAggregated: true  // V2 format - skip client-side aggregation
 }
 ```
 
-**SSE (base64 encoded, full tensor):**
+**SSE JSON:**
+```json
+{
+  "format": "aggregated",
+  "shape": [256],
+  "context_length": 256,
+  "dtype": "float32",
+  "data": [0.005145, 0.035900, ...]
+}
+```
+
+**V1 API (Full Tensor - Legacy):**
+
+**SSE base64:**
 ```json
 {
   "format": "per_layer",
@@ -590,8 +623,9 @@ const floats = new Float32Array(event.data);  // [context_length]
 ```
 
 **Performance comparison:**
-- WebSocket binary: ~8KB/token, ~10ms/token
-- SSE base64: ~6.5MB/token, ~150ms/token
+- V2 WebSocket binary: ~8KB/token, ~10ms/token
+- V2 SSE JSON: ~8KB/token, ~15ms/token
+- V1 SSE base64: ~6.5MB/token, ~150ms/token
 
 ---
 
@@ -609,13 +643,16 @@ const floats = new Float32Array(event.data);  // [context_length]
 - [ ] Add visual settings (font size, color scheme)
 - [ ] Manual token deletion (click to prune)
 - [ ] Undo pruning (manual resurrection from semantic index)
-- [ ] **Pin chunks** - Mark chunks as immune to pruning
-- [ ] **Merge chunks** - Combine two adjacent chunks (update sentence_ids, re-embed)
+- [x] **Pin chunks** - Mark chunks as immune to pruning ✅ Implemented
+- [x] **Merge chunks** - Combine two adjacent chunks (update sentence_ids, re-embed) ✅ Implemented
+- [x] **Paired resurrection** - User chunks bring assistant s0 from next turn, assistant chunks bring user s0 from previous turn. Preserves Q→A structure. ✅ Implemented
+- [x] **User boost in retrieval** - User content gets 1.5x similarity boost (denser signal, smaller chunks) ✅ Implemented
 
 **Medium Term:**
 - [ ] Multiple conversation tabs
 - [x] Web Workers for semantic index embedding (off main thread) ✅ Implemented
 - [ ] Attention pattern analysis (which tokens attended to which)
+- [ ] **MMR (Maximal Marginal Relevance) for resurrection** - Instead of top-K by similarity, iteratively select chunks that maximize `λ * sim(query, chunk) - (1-λ) * max_sim(chunk, already_selected)`. Prevents resurrecting 10 variations of the same idea. Only implement if redundancy becomes a visible problem - attention decay may already handle this naturally.
 
 **Long Term:**
 - [ ] Multi-model comparison
@@ -698,7 +735,7 @@ const floats = new Float32Array(event.data);  // [context_length]
 
 ## Related Documentation
 
-- `KOBOLD_API_SPEC.md` - KoboldCPP API specification
+- `KOBOLD_API_SPEC_V2.md` - KoboldCPP V2 API specification (aggregated attention)
 - `SEMANTIC_INDEX.md` - Semantic index design document
 - `BRIGHTNESS_STRATEGIES.md` - Comparison of scoring algorithms
 - `tests/README.md` - Test framework documentation
