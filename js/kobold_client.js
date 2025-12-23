@@ -3,42 +3,15 @@
  *
  * Handles all communication with KoboldCPP server:
  * - REST API for model info, tokenization
- * - WebSocket for streaming generation with binary attention
- * - Fallback SSE for compatibility
+ * - SSE for streaming generation with base64-encoded attention
  */
 
 export class KoboldClient {
     constructor(baseUrl = 'http://localhost:5001') {
         this.baseUrl = baseUrl;
-        this.wsUrl = baseUrl.replace(/^http/, 'ws');
-        this.ws = null;  // Track active WebSocket for cleanup
         this.modelInfo = null;
-        this.useWebSocket = true;  // Prefer WebSocket for binary streaming
-        this.attentionVersion = null;  // API version: 1 (per-layer) or 2 (aggregated)
     }
 
-    /**
-     * Force-close any active WebSocket connection.
-     * Browser WebSockets wait for close handshake acknowledgment (can take 10s+).
-     * This immediately terminates the connection without waiting.
-     */
-    _forceCloseWebSocket() {
-        if (this.ws) {
-            console.log('🔌 Force-closing lingering WebSocket');
-            // Remove all handlers to prevent callbacks during close
-            this.ws.onopen = null;
-            this.ws.onmessage = null;
-            this.ws.onerror = null;
-            this.ws.onclose = null;
-            // Close immediately - don't wait for handshake
-            try {
-                this.ws.close();
-            } catch (e) {
-                // Ignore errors during force-close
-            }
-            this.ws = null;
-        }
-    }
 
     /**
      * Get model information (architecture, special tokens, etc.)
@@ -53,28 +26,6 @@ export class KoboldClient {
         return this.modelInfo;
     }
 
-    /**
-     * Get attention API version from server
-     * @returns {Promise<number>} Version number (1 or 2)
-     */
-    async getAttentionVersion() {
-        try {
-            const response = await fetch(`${this.baseUrl}/api/extra/attention_version`);
-            if (!response.ok) {
-                console.warn('Attention version endpoint not found, assuming V1');
-                this.attentionVersion = 1;
-                return 1;
-            }
-            const data = await response.json();
-            this.attentionVersion = data.version || 1;
-            console.log(`📡 Attention API version: ${this.attentionVersion}`);
-            return this.attentionVersion;
-        } catch (err) {
-            console.warn('Failed to get attention version, assuming V1:', err);
-            this.attentionVersion = 1;
-            return 1;
-        }
-    }
 
     /**
      * Tokenize text using the model's tokenizer
@@ -145,7 +96,7 @@ export class KoboldClient {
 
     /**
      * Stream generation with attention extraction
-     * Uses WebSocket with binary frames (fast) or falls back to SSE
+     * Uses SSE (Server-Sent Events) with base64-encoded attention
      * @param {Array<number>} inputIds - Input token IDs
      * @param {Object} config - Generation config
      * @param {Function} onToken - Callback for each token: (tokenId, text, attention) => void
@@ -153,132 +104,12 @@ export class KoboldClient {
      * @param {Function} onError - Callback for errors
      */
     async generateStream(inputIds, config, onToken, onDone, onError) {
-        if (this.useWebSocket) {
-            return this._generateStreamWS(inputIds, config, onToken, onDone, onError);
-        }
         return this._generateStreamSSE(inputIds, config, onToken, onDone, onError);
     }
 
-    /**
-     * WebSocket streaming with binary attention frames
-     * Zero-copy attention decoding - ~99% faster than SSE+base64
-     */
-    async _generateStreamWS(inputIds, config, onToken, onDone, onError) {
-        // Force-close any lingering WebSocket from previous generation
-        // This prevents connection buildup that causes tokenization timeouts
-        this._forceCloseWebSocket();
-        
-        return new Promise((resolve, reject) => {
-            const requestId = this._generateRequestId();
-            let pendingToken = null;
-            let tokenCount = 0;
-            const startTime = performance.now();
-            
-            // Get model info for attention shape
-            const numLayers = this.modelInfo?.num_layers || 28;
-            const numHeads = this.modelInfo?.num_attention_heads || 28;
-            
-            const ws = new WebSocket(`${this.wsUrl}/api/extra/generate/stream/ws`);
-            this.ws = ws;  // Track for cleanup
-            ws.binaryType = 'arraybuffer';
-            
-            ws.onopen = () => {
-                // Send generation config
-                ws.send(JSON.stringify({
-                    input_ids: inputIds,
-                    max_length: config.maxNewTokens || 50,
-                    temperature: config.temperature || 0.7,
-                    top_p: config.topP || 0.9,
-                    top_k: config.topK || 40,
-                    rep_pen: config.repetitionPenalty || 1.0,
-                    output_attentions: config.returnAttention !== false,
-                    request_id: requestId,
-                    sampler_seed: config.seed || -1
-                }));
-            };
-            
-            ws.onmessage = (event) => {
-                if (typeof event.data === 'string') {
-                    // Text frame - token metadata or done
-                    const data = JSON.parse(event.data);
-                    
-                    if (data.type === 'token') {
-                        pendingToken = data;
-                        tokenCount++;
-                        
-                        // If no attention expected, deliver token immediately
-                        if (config.returnAttention === false) {
-                            onToken(data.token_id, data.text, null);
-                            pendingToken = null;
-                        }
-                    } else if (data.type === 'done') {
-                        const elapsed = (performance.now() - startTime) / 1000;
-                        console.log(`🚀 WebSocket: ${tokenCount} tokens in ${elapsed.toFixed(1)}s (${(tokenCount/elapsed).toFixed(1)} tok/s)`);
-                        pendingToken = null;
-                        // Clear reference before close to prevent race conditions
-                        if (this.ws === ws) {
-                            this.ws = null;
-                        }
-                        ws.close();
-                        onDone(data);
-                        resolve();
-                    }
-                } else {
-                    // Binary frame - pre-aggregated float32 attention data
-                    // V2 API: Server already computed mean(axis=(0,1)), so shape is just [contextLen]
-                    const floats = new Float32Array(event.data);
-                    const contextLen = floats.length;
-                    
-                    const attention = {
-                        data: floats,
-                        shape: [1, 1, contextLen],  // Compatibility shape
-                        contextLength: contextLen,
-                        preAggregated: true  // V2 format - skip client-side aggregation
-                    };
-                    
-                    // Deliver token with attention
-                    if (pendingToken) {
-                        onToken(pendingToken.token_id, pendingToken.text, attention);
-                        pendingToken = null;
-                    }
-                }
-            };
-            
-            ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                console.log('Falling back to SSE...');
-                this.useWebSocket = false;
-                // Clear reference before close
-                if (this.ws === ws) {
-                    this.ws = null;
-                }
-                ws.close();
-                // Fallback to SSE
-                this._generateStreamSSE(inputIds, config, onToken, onDone, onError)
-                    .then(resolve)
-                    .catch(reject);
-            };
-            
-            ws.onclose = (event) => {
-                // Clear tracked reference
-                if (this.ws === ws) {
-                    this.ws = null;
-                }
-                // Only error on abnormal close codes (not 1000/1001 which are normal)
-                // 1000 = normal closure, 1001 = going away (page unload)
-                if (event.code !== 1000 && event.code !== 1001) {
-                    const err = new Error(`WebSocket closed unexpectedly: ${event.code}`);
-                    onError(err);
-                    reject(err);
-                }
-                // Normal close after 'done' is fine - resolve() already called
-            };
-        });
-    }
 
     /**
-     * SSE streaming with base64 attention (fallback)
-     * Slower but more compatible
+     * SSE streaming with base64-encoded attention
      */
     async _generateStreamSSE(inputIds, config, onToken, onDone, onError) {
         try {
@@ -405,34 +236,11 @@ export class KoboldClient {
     }
 
     /**
-     * Decode attention from SSE response (supports V1 base64 and V2 aggregated)
-     * @param {Object} attentionInfo - Attention data from server
-     * @returns {Object} Attention object with {data, shape, contextLength, preAggregated?}
-     */
-    _decodeAttentionSSE(attentionInfo) {
-        // V2: Aggregated format - data is already a float array
-        if (attentionInfo.format === 'aggregated') {
-            const contextLen = attentionInfo.context_length || attentionInfo.shape[0];
-            const floats = new Float32Array(attentionInfo.data);
-            
-            return {
-                data: floats,
-                shape: [1, 1, contextLen],  // Compatibility shape
-                contextLength: contextLen,
-                preAggregated: true  // Skip client-side aggregation
-            };
-        }
-        
-        // V1: Base64-encoded tensor - decode and return full tensor
-        return this._decodeAttentionV1(attentionInfo);
-    }
-
-    /**
-     * Decode V1 base64-encoded attention tensor
+     * Decode base64-encoded attention tensor from SSE response
      * @param {Object} attentionInfo - Attention data from server
      * @returns {Object} Attention object with {data, shape, contextLength}
      */
-    _decodeAttentionV1(attentionInfo) {
+    _decodeAttentionSSE(attentionInfo) {
         // Decode base64 to binary - use native fetch for speed
         const binaryString = atob(attentionInfo.data);
         const len = binaryString.length;
@@ -458,8 +266,7 @@ export class KoboldClient {
         return {
             data: floats,
             shape: attentionInfo.shape,
-            contextLength: attentionInfo.context_length,
-            preAggregated: false  // Needs client-side aggregation
+            contextLength: attentionInfo.context_length
         };
     }
 
@@ -479,14 +286,14 @@ export class KoboldClient {
      * Close any active connections and abort pending operations
      */
     disconnect() {
-        this._forceCloseWebSocket();
+        // No persistent connections in SSE-only mode
     }
 
     /**
-     * Abort any active generation (alias for disconnect)
+     * Abort any active generation
      */
     abort() {
-        this._forceCloseWebSocket();
+        // No persistent connections in SSE-only mode
     }
 
     /**

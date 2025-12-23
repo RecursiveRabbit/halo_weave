@@ -23,14 +23,14 @@ When a sequence is returned via RAG we don't stick it at the end of the context,
 The Chekhov's gun from turn 1 reappears in turn 1 when it becomes relevant in turn 80.
 A resurrected chunk is treated as new context, with a default brightness score, and must then either prove itself or be deleted again on subsequent turns. 
 
-**For:** AI assistants working on this project
+**For:** AI collaborators working on this project
 **Last Verified Against Code:** 2025-12-15
 
 ---
 
 ## Project Overview
 
-Halo Weave is a **pure frontend application** for visualizing transformer attention patterns and performing brightness-based context pruning with semantic resurrection. It connects directly to a modified KoboldCPP server via WebSocket for real-time attention streaming.
+Halo Weave is a **pure frontend application** for visualizing transformer attention patterns and performing brightness-based context pruning with semantic resurrection. It connects directly to a modified KoboldCPP server via SSE (Server-Sent Events) for real-time attention streaming.
 
 **Status:** Data Science and Endless Testing. 
 
@@ -43,7 +43,7 @@ Halo Weave is a **pure frontend application** for visualizing transformer attent
 - **Frontend:** Vanilla JavaScript (ES6 modules), HTML5, CSS3
 - **No build step:** No webpack, no npm, no babel - just native modules
 - **Inference backend:** KoboldCPP (separate process)
-- **Communication:** WebSocket for streaming, REST for metadata
+- **Communication:** SSE (Server-Sent Events) for streaming, REST for metadata
 
 ### Components
 
@@ -51,7 +51,7 @@ Halo Weave is a **pure frontend application** for visualizing transformer attent
 index.html
   ↓
 app.js (Main Controller)
-  ├─> kobold_client.js   (KoboldCPP API adapter - WebSocket + REST)
+  ├─> kobold_client.js   (KoboldCPP API adapter - SSE + REST)
   ├─> conversation.js    (Token storage + Magnitude Voting v3 + pruning + short line merging)
   ├─> renderer.js        (DOM rendering + dual-layer brightness visualization)
   ├─> semantic_index.js  (Append-only vector DB for context resurrection via transformers.js)
@@ -75,10 +75,9 @@ KoboldClient.tokenize() - REST POST to /api/v1/tokenize
 Conversation.addMessage() - store tokens with position IDs
        │
        ▼
-KoboldClient.generateStream() - WebSocket to /api/extra/generate/stream/ws
+KoboldClient.generateStream() - SSE POST to /api/extra/generate/stream
        │
-       ├── Text frame: {type: "token", token_id, text}
-       ├── Binary frame: Float32Array (pre-aggregated attention)
+       ├── SSE event: {type: "token", token: {token_id, text}, attention: {...}}
        │
        ▼
 Conversation.updateBrightness() - Magnitude Voting v3 scoring
@@ -147,8 +146,7 @@ Proportional decay prevents ceiling pile-up (high-brightness tokens decay faster
 - BOS token is attention sink (up to 40% of total) - excluded from threshold calculation
 - Current turn tokens skip scoring entirely (they're in their local attention wave)
 - Magnitude captures intensity, not just frequency
-- V2 API: Server-side aggregation reduces bandwidth from ~6.5MB to ~8KB per token
-- V1 API: Client-side aggregation (fallback for older servers)
+- Attention data is base64-encoded and aggregated client-side
 
 ### 3. Array Index ↔ Position ID Mapping
 
@@ -288,23 +286,19 @@ Short paragraphs, lists, and headers merge into the next chunk until the minimum
 - ❌ Actually remove deleted tokens from array
 - ❌ Retokenize existing context
 - ❌ Initialize tokens at 0 brightness
-- ❌ Clamp brightness scores
 
 ### When Modifying kobold_client.js
 
 **DO:**
-- ✅ Use WebSocket binary frames for attention (pre-aggregated Float32Array)
-- ✅ Force-close lingering WebSockets before new generation (`_forceCloseWebSocket()`)
-- ✅ Fall back to SSE if WebSocket fails
+- ✅ Use SSE (Server-Sent Events) for streaming generation
+- ✅ Decode base64-encoded attention tensors
 - ✅ Use 5s timeout on tokenize requests
-- ✅ Detect API version via `/api/extra/attention_version` on startup
-- ✅ Support both V1 (base64 tensor) and V2 (aggregated array) formats
+- ✅ Handle attention data with shape [layers, heads, context_length]
 
 **DON'T:**
 - ❌ Store conversation state (client is stateless)
-- ❌ Wait for WebSocket close handshake (can take 10s+)
 - ❌ Assume specific model (query /api/v1/model)
-- ❌ Assume specific API version (detect via version endpoint)
+- ❌ Skip error handling for missing attention data
 
 ### When Modifying renderer.js
 
@@ -361,7 +355,7 @@ See `index.html` for authoritative defaults. Key values:
 - **Max New Tokens:** 50 (slider max: 2048)
 - **Max Context Tokens:** 2000 (0 = no pruning)
 - **Initial Brightness:** 255
-- **Decay per step:** -1 (when below threshold)
+- **Decay per step:** 1% proportional (min -1, when below threshold)
 
 ---
 
@@ -440,9 +434,9 @@ window.app.client.abort()
 
 **Fix:**
 1. Check browser console for errors
-2. Verify WebSocket endpoint `/api/extra/generate/stream/ws` is available
+2. Verify SSE endpoint `/api/extra/generate/stream` is available
 3. Confirm KoboldCPP has attention extraction enabled
-4. Check if falling back to SSE (slower but still works)
+4. Check for base64 decoding errors in console
 
 ### Tokens not decaying
 
@@ -471,24 +465,12 @@ window.app.client.abort()
 2. Verify conversation.currentRole is set before adding tokens
 3. Rebuild display: `app.renderer.rebuild(app.conversation)`
 
-### WebSocket connection issues
-
-**Cause:** Lingering WebSocket from previous generation blocking new connections
-
-**Symptoms:**
-- "Tokenization timed out after 5s"
-- Requests hang after several messages
-
-**Fix:**
-1. Restart KoboldCPP to clear connection pool
-2. Check `_forceCloseWebSocket()` is being called before new generation
-3. Use Chrome/Brave instead of Firefox (Firefox has intermittent issues)
 
 ---
 
 ## Performance
 
-### Current Performance (with server-side aggregation)
+### Current Performance
 
 **Typical generation (500 token context):**
 - **Wall clock:** ~27ms/token
@@ -498,13 +480,13 @@ window.app.client.abort()
   - updateBrightness: ~0.04ms
   - updateColors: ~0.1ms
   - renderToken: ~0.1ms
-- **Attention size:** ~8KB/token (pre-aggregated)
+- **Attention size:** ~1MB/token (base64-encoded)
 
 **Large context (1700+ tokens):**
 - **Wall clock:** ~78ms/token
 - **Token gaps:** ~71ms/token
 - **Our processing:** ~6ms/token
-- **Attention size:** ~7.7MB/token (if using SSE fallback)
+- **Attention size:** ~6.5MB/token (base64-encoded)
 
 **Semantic index operations:**
 - First embed: ~2-3s (model init + WASM warmup)
@@ -514,12 +496,11 @@ window.app.client.abort()
 
 ### Optimizations Already Implemented
 
-1. **Server-side aggregation** - 784x bandwidth reduction (6.5MB → 8KB)
-2. **WebSocket binary frames** - Zero-copy Float32Array, no base64
-3. **O(1) DOM lookups** - tokenElements Map
-4. **requestAnimationFrame debouncing** - Coalesce color updates
-5. **Active token caching** - Avoid repeated filter operations
-6. **Numeric sentence keys** - Avoid string concatenation in hot path
+1. **O(1) DOM lookups** - tokenElements Map
+2. **requestAnimationFrame debouncing** - Coalesce color updates
+3. **Active token caching** - Avoid repeated filter operations
+4. **Numeric sentence keys** - Avoid string concatenation in hot path
+5. **Client-side attention aggregation** - Efficient mean calculation across layers/heads
 
 ### If Performance Becomes an Issue
 
@@ -533,24 +514,9 @@ window.app.client.abort()
 
 ## API Integration (KoboldCPP)
 
-### API Version Detection
-
-**Endpoint:** `GET /api/extra/attention_version`
-
-**Response:**
-```json
-{"version": 2}
-```
-
-**Versions:**
-- **V1**: Full tensor `[layers, heads, seq_len]` per token (~6.5MB base64)
-- **V2**: Aggregated `[seq_len]` per token (~8KB raw floats)
-
-Halo Weave automatically detects and adapts to the server's API version on startup.
-
 ### Required Endpoints
 
-See `KOBOLD_API_SPEC_V2.md` for complete V2 specification.
+See `KOBOLD_API_SPEC.md` for complete specification.
 
 **Model Info:**
 ```
@@ -565,15 +531,7 @@ POST /api/v1/tokenize
 → {tokens: [{token_id, text}, ...]}
 ```
 
-**Streaming Generation (WebSocket - preferred):**
-```
-WS /api/extra/generate/stream/ws
-→ Text frame: {"type": "token", "token_id": 123, "text": "Hello"}
-→ Binary frame: Float32Array[context_length] (pre-aggregated attention)
-→ Text frame: {"type": "done", ...}
-```
-
-**Streaming Generation (SSE - fallback):**
+**Streaming Generation (SSE):**
 ```
 POST /api/extra/generate/stream
 → data: {"type": "token", "token": {...}, "attention": {base64 encoded}}
@@ -582,50 +540,19 @@ POST /api/extra/generate/stream
 
 ### Attention Data Format
 
-**V2 API (Aggregated):**
-
-**WebSocket binary frame:**
-```javascript
-// Binary frame is raw Float32Array
-const floats = new Float32Array(event.data);  // [context_length]
-
-// Wrapped for conversation.js:
-{
-  data: floats,
-  shape: [1, 1, contextLen],  // Compatibility shape
-  contextLength: contextLen,
-  preAggregated: true  // V2 format - skip client-side aggregation
-}
-```
-
-**SSE JSON:**
-```json
-{
-  "format": "aggregated",
-  "shape": [256],
-  "context_length": 256,
-  "dtype": "float32",
-  "data": [0.005145, 0.035900, ...]
-}
-```
-
-**V1 API (Full Tensor - Legacy):**
-
-**SSE base64:**
+**SSE with base64-encoded tensor:**
 ```json
 {
   "format": "per_layer",
   "shape": [28, 28, 500],
   "encoding": "base64",
   "dtype": "float32",
-  "data": "AAAA..."
+  "data": "AAAA...",
+  "context_length": 500
 }
 ```
 
-**Performance comparison:**
-- V2 WebSocket binary: ~8KB/token, ~10ms/token
-- V2 SSE JSON: ~8KB/token, ~15ms/token
-- V1 SSE base64: ~6.5MB/token, ~150ms/token
+The client decodes the base64 data and aggregates across layers and heads to produce the final attention scores.
 
 ---
 
@@ -633,6 +560,7 @@ const floats = new Float32Array(event.data);  // [context_length]
 
 ### Bugs to Investigate
 
+- [ ] **User turns appended to agent turns** - Currently user turns are getting attached to the bottom of the previous agent turn instead of showing up as their own turn. 
 - [ ] **Stale state after refresh** - Occasionally, old conversation content persists after page refresh. Hard refresh (Ctrl+Shift+R) clears it. May be browser caching JS files.
 - [ ] **End token tokenization hanging** - `<|im_end|>` tokenization after generation sometimes hangs. Currently commented out in app.js.
 - [ ] **Off-by-one on assistant turns** - AI sometimes answers the previous question instead of the current one. Likely a turn boundary or resurrection timing issue.
@@ -664,8 +592,8 @@ const floats = new Float32Array(event.data);  // [context_length]
 ## Dependencies
 
 **Runtime:**
-- Modern browser (Chrome 120+, Firefox 120+ with caveats)
-- KoboldCPP server with attention extraction and WebSocket support
+- Modern browser (Chrome 120+, Firefox 120+)
+- KoboldCPP server with attention extraction and SSE support
 - transformers.js (loaded from CDN on first semantic index use, ~23MB)
 
 **Development:**
@@ -735,11 +663,11 @@ const floats = new Float32Array(event.data);  // [context_length]
 
 ## Related Documentation
 
-- `KOBOLD_API_SPEC_V2.md` - KoboldCPP V2 API specification (aggregated attention)
+- `KOBOLD_API_SPEC.md` - KoboldCPP API specification
 - `SEMANTIC_INDEX.md` - Semantic index design document
 - `BRIGHTNESS_STRATEGIES.md` - Comparison of scoring algorithms
 - `tests/README.md` - Test framework documentation
-- `../attention_heatmap/` - V1 reference (PyTorch proof of concept)
+- `../attention_heatmap/` - Reference implementation (PyTorch proof of concept)
 
 ---
 

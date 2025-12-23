@@ -18,7 +18,7 @@ Halo Weave visualizes transformer attention patterns during text generation and 
 python3 koboldcpp.py --model your_model.gguf --port 5001 --usecublas --gpulayers 999 --contextsize 8192
 ```
 
-Requires modified KoboldCPP with attention extraction and WebSocket streaming.
+Requires modified KoboldCPP with attention extraction and SSE streaming.
 
 ### 2. Serve Frontend
 
@@ -38,7 +38,7 @@ Type a message, watch tokens appear with brightness colors. Yellow = high attent
 index.html
   ↓
 app.js (Main Controller)
-  ├─> kobold_client.js   (KoboldCPP API - WebSocket + REST)
+  ├─> kobold_client.js   (KoboldCPP API - SSE + REST)
   ├─> conversation.js    (Token storage + Magnitude Voting + pruning)
   ├─> renderer.js        (DOM rendering + brightness visualization)
   └─> semantic_index.js  (Vector DB for resurrection via transformers.js)
@@ -51,12 +51,13 @@ app.js (Main Controller)
 ### Magnitude Voting (Brightness Scoring)
 
 Each generation step:
-1. Server sends pre-aggregated attention `[context_length]`
-2. Calculate threshold: `(1.0 - bos_attention) / (context_len - 1)`
-3. For each token (excluding current turn):
+1. Server sends base64-encoded attention tensor `[layers, heads, context_length]`
+2. Client aggregates across layers and heads
+3. Calculate threshold: `(1.0 - bos_attention) / (context_len - 1)`
+4. For each token (excluding current turn):
    - `attention > threshold`: brightness += int(attention / threshold)
    - `attention <= threshold`: brightness -= 1
-4. Brightness capped at 10,000 to prevent immortal tokens
+5. Brightness capped at 10,000 to prevent immortal tokens
 
 ### Pruning
 
@@ -99,7 +100,7 @@ halo_weave/
 ## Requirements
 
 - Modern browser (Chrome 120+, Firefox 120+)
-- KoboldCPP with attention extraction and WebSocket support
+- KoboldCPP with attention extraction and SSE support
 - transformers.js (loaded from CDN on first semantic index use, ~23MB)
 
 ## License

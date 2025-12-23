@@ -4,7 +4,7 @@
  * Coordinates:
  * - KoboldClient for model communication
  * - Conversation for token storage + brightness scoring
- * - Renderer for grayscale visualization
+ * - Renderer for yellow brightness visualization
  * - DataCapture for attention recording
  */
 
@@ -93,10 +93,8 @@ class App {
         
         try {
             const modelInfo = await this.client.getModelInfo();
-            const attentionVersion = await this.client.getAttentionVersion();
-            
-            const versionLabel = attentionVersion === 2 ? ' (V2 Aggregated)' : ' (V1)';
-            this._setStatus(`Connected: ${modelInfo.model_name || 'Unknown Model'}${versionLabel}`, 'connected');
+
+            this._setStatus(`Connected: ${modelInfo.model_name || 'Unknown Model'}`, 'connected');
             console.log('Model info:', modelInfo);
         } catch (err) {
             this._setStatus('Connection failed - is KoboldCPP running?', 'error');
@@ -173,16 +171,20 @@ class App {
                     console.log('📤 Adding system prompt...');
                     await this._addMessage('system', systemPrompt);
                     console.log('📤 System prompt added');
+                    // Increment turn after system prompt (system=turn0, user will be turn1)
+                    this.conversation.nextTurn();
                 }
             }
-            
+
             // Query graveyard for relevant context before adding user message
             await this._resurrectRelevantContext(text);
-            
+
             // Add user message
             console.log('📤 Adding user message...');
             await this._addMessage('user', text);
             console.log('📤 User message added, starting generation...');
+            // Increment turn after user message (assistant will be on next turn)
+            this.conversation.nextTurn();
             
             // Only clear input after user message successfully added (tokenization worked)
             this.elements.userInput.value = '';
@@ -381,11 +383,12 @@ class App {
         
         // Tokenize
         const tokens = await this.client.tokenize(formatted);
-        
+
         // Add to conversation
         this.conversation.addMessage(role, tokens);
-        this.conversation.nextTurn();
-        
+        // NOTE: Don't call nextTurn() here - it's called after generation completes
+        // This ensures user message and assistant response are on different turns
+
         // Record prompt tokens if capturing
         if (this.capture.isCapturing && role !== 'assistant') {
             await this.capture.recordPromptTokens(this.conversation.tokens);
