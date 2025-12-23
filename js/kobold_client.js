@@ -142,8 +142,6 @@ export class KoboldClient {
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
-            this._jsonParseTime = 0;
-            this._bufferOpTime = 0;
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -151,47 +149,30 @@ export class KoboldClient {
                 if (done) break;
 
                 // Decode chunk and add to buffer
-                let t0 = performance.now();
                 buffer += decoder.decode(value, { stream: true });
 
                 // Process complete SSE messages
                 const lines = buffer.split('\n');
                 buffer = lines.pop() || ''; // Keep incomplete line in buffer
-                this._bufferOpTime += performance.now() - t0;
 
                 for (const line of lines) {
                     if (line.startsWith('data: ')) {
                         const jsonData = line.slice(6); // Remove 'data: ' prefix
 
                         try {
-                            t0 = performance.now();
                             const data = JSON.parse(jsonData);
-                            this._jsonParseTime += performance.now() - t0;
 
                             if (data.type === 'token') {
                                 // Decode attention if present
                                 let attention = null;
                                 if (data.attention && config.returnAttention !== false) {
-                                    const t0 = performance.now();
                                     attention = this._decodeAttentionSSE(data.attention);
-                                    this._decodeTime = (this._decodeTime || 0) + (performance.now() - t0);
-                                    this._decodeCount = (this._decodeCount || 0) + 1;
                                 }
 
                                 // Call token callback
                                 onToken(data.token.token_id, data.token.text, attention);
 
                             } else if (data.type === 'done') {
-                                // Log decode timing
-                                const n = this._decodeCount || 1;
-                                console.log(`📊 SSE Processing breakdown:`);
-                                console.log(`   Buffer ops:    ${(this._bufferOpTime/1000).toFixed(1)}s (${(this._bufferOpTime/n).toFixed(1)}ms/token)`);
-                                console.log(`   JSON parse:    ${(this._jsonParseTime/1000).toFixed(1)}s (${(this._jsonParseTime/n).toFixed(1)}ms/token)`);
-                                console.log(`   Base64 decode: ${(this._decodeTime/1000).toFixed(1)}s (${(this._decodeTime/n).toFixed(1)}ms/token)`);
-                                this._decodeTime = 0;
-                                this._decodeCount = 0;
-                                this._jsonParseTime = 0;
-                                this._bufferOpTime = 0;
                                 onDone(data);
                                 return;
 
@@ -201,16 +182,6 @@ export class KoboldClient {
                                     // This is the last token
                                     onToken(null, data.token, null);
                                 }
-                                // Log timing
-                                const n = this._decodeCount || 1;
-                                console.log(`📊 SSE Processing breakdown:`);
-                                console.log(`   Buffer ops:    ${(this._bufferOpTime/1000).toFixed(1)}s (${(this._bufferOpTime/n).toFixed(1)}ms/token)`);
-                                console.log(`   JSON parse:    ${(this._jsonParseTime/1000).toFixed(1)}s (${(this._jsonParseTime/n).toFixed(1)}ms/token)`);
-                                console.log(`   Base64 decode: ${(this._decodeTime/1000).toFixed(1)}s (${(this._decodeTime/n).toFixed(1)}ms/token)`);
-                                this._decodeTime = 0;
-                                this._decodeCount = 0;
-                                this._jsonParseTime = 0;
-                                this._bufferOpTime = 0;
                                 onDone({ finish_reason: data.finish_reason, request_id: requestId });
                                 return;
                             }
@@ -222,12 +193,6 @@ export class KoboldClient {
             }
 
             // If we reach here without a done event, still call onDone
-            // Log decode timing
-            if (this._decodeCount) {
-                console.log(`🔓 Base64 decode: ${(this._decodeTime/1000).toFixed(1)}s total (${(this._decodeTime/this._decodeCount).toFixed(1)}ms/token)`);
-                this._decodeTime = 0;
-                this._decodeCount = 0;
-            }
             onDone({ finish_reason: 'complete', request_id: requestId });
 
         } catch (error) {
@@ -238,14 +203,14 @@ export class KoboldClient {
     /**
      * Decode base64-encoded attention tensor from SSE response
      * @param {Object} attentionInfo - Attention data from server
-     * @returns {Object} Attention object with {data, shape, contextLength}
+     * @returns {Object} Attention object with {data, shape, contextLength, preAggregated}
      */
     _decodeAttentionSSE(attentionInfo) {
         // Decode base64 to binary - use native fetch for speed
         const binaryString = atob(attentionInfo.data);
         const len = binaryString.length;
         const bytes = new Uint8Array(len);
-        
+
         // Unrolled loop - process 4 bytes at a time
         let i = 0;
         const len4 = len - 3;
@@ -263,10 +228,14 @@ export class KoboldClient {
         // Convert to Float32Array (zero-copy view)
         const floats = new Float32Array(bytes.buffer);
 
+        // Detect if server sent pre-aggregated data (new format)
+        const isAggregated = attentionInfo.format === 'aggregated';
+
         return {
             data: floats,
-            shape: attentionInfo.shape,
-            contextLength: attentionInfo.context_length
+            shape: isAggregated ? [1, 1, attentionInfo.context_length] : attentionInfo.shape,
+            contextLength: attentionInfo.context_length,
+            preAggregated: isAggregated  // Signal to conversation.js to skip aggregation
         };
     }
 
