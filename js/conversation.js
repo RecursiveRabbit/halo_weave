@@ -1,32 +1,37 @@
 /**
  * Conversation - Token Storage + Magnitude Voting v3
- * 
+ *
  * Single source of truth for conversation history with integrated brightness scoring.
- * 
+ *
  * Algorithm (per generation step):
  * 1. Aggregate attention across layers/heads
  * 2. Calculate threshold excluding BOS: (1.0 - bos_attention) / (context_len - 1)
- * 3. For each non-BOS token:
- *    - If attention > threshold: score += int(attention / threshold)
+ * 3. Calculate mean brightness across all active tokens (excluding current turn)
+ * 4. For each non-BOS token:
+ *    - If attention > threshold: score += int(attention / threshold), cap at 10000
  *    - If attention <= threshold: score -= 1
- * 4. New tokens start at 255
- * 5. No clamping - scores can go negative
- * 
+ * 5. New tokens start at 10000 (fail-bright)
+ * 6. Resurrected tokens start at mean brightness (unproven but relevant)
+ * 7. No floor - scores can go negative
+ *
  * Pruning: while (activeTokenCount > budget) { delete lowest peak brightness sentence }
  */
 
 export class Conversation {
-    constructor() {
+    constructor(options = {}) {
         // Master token list - soft delete only
         this.tokens = [];
-        
+
+        // Persistent storage
+        this.store = options.store || null;  // PersistentStore instance
+
         // Position counter - monotonically increasing, never reused
         this.nextPosition = 0;
-        
+
         // Turn tracking
         this.currentTurnId = 0;
         this.currentRole = null;
-        
+
         // Sentence tracking within current turn
         this.currentSentenceId = 0;
         
@@ -42,54 +47,199 @@ export class Conversation {
         // Invalidated on add/delete, rebuilt lazily
         this._activeTokensCache = null;
         this._activeTokenCount = 0;
+
+        // === Mean brightness tracking ===
+        // Updated during brightness scoring, used for resurrection
+        this.meanBrightness = 5000;  // Default for theoretical empty-context case
     }
 
     // ========== Token Management ==========
 
     /**
+     * Load all live tokens from IndexedDB into memory
+     * Called on app startup to rehydrate the conversation
+     */
+    async loadAllLiveTokensFromStore() {
+        if (!this.store) return;
+
+        console.log('📥 Loading all live tokens from IndexedDB...');
+        const tokens = await this.store.getAllLiveTokens();
+
+        // Sort by position
+        tokens.sort((a, b) => a.position - b.position);
+
+        // Replace in-memory tokens with persisted ones
+        this.tokens = tokens;
+
+        // Update nextPosition if needed
+        if (this.tokens.length > 0) {
+            const maxPos = this.tokens[this.tokens.length - 1].position;
+            if (maxPos >= this.nextPosition) {
+                this.nextPosition = maxPos + 1;
+            }
+        }
+
+        this._invalidateCache();
+
+        console.log(`📥 Loaded ${tokens.length} live tokens`);
+    }
+
+    /**
+     * Load tokens from IndexedDB by position IDs
+     * Used during resurrection to populate in-memory token list
+     * @param {Array<number>} positions - Position IDs to load
+     */
+    async loadTokensFromStore(positions) {
+        if (!this.store || positions.length === 0) return;
+
+        // Load tokens in parallel
+        const promises = positions.map(pos => this.store.getToken(pos));
+        const tokens = await Promise.all(promises);
+
+        // Add to in-memory list (skip nulls)
+        for (const token of tokens) {
+            if (token && !this.tokens.find(t => t.position === token.position)) {
+                this.tokens.push(token);
+            }
+        }
+
+        // Sort by position to maintain order
+        this.tokens.sort((a, b) => a.position - b.position);
+
+        // Update nextPosition if needed
+        if (this.tokens.length > 0) {
+            const maxPos = this.tokens[this.tokens.length - 1].position;
+            if (maxPos >= this.nextPosition) {
+                this.nextPosition = maxPos + 1;
+            }
+        }
+
+        this._invalidateCache();
+    }
+
+    /**
+     * Load metadata from IndexedDB and restore state
+     */
+    async loadMetadataFromStore() {
+        if (!this.store) return;
+
+        const metadata = await this.store.getMetadata();
+
+        this.nextPosition = metadata.nextPosition || 0;
+        this.currentTurnId = metadata.nextTurn || 0;
+        this.currentSentenceId = metadata.currentSentence || 0;
+        this.currentRole = metadata.currentRole || null;
+
+        console.log(`📝 Loaded metadata: position=${this.nextPosition}, turn=${this.currentTurnId}`);
+    }
+
+    /**
+     * Save metadata to IndexedDB
+     */
+    async saveMetadataToStore() {
+        if (!this.store) return;
+
+        await this.store.saveMetadata({
+            nextPosition: this.nextPosition,
+            nextTurn: this.currentTurnId,
+            currentSentence: this.currentSentenceId,
+            currentRole: this.currentRole
+        });
+    }
+
+    /**
      * Add a message (multiple tokens) to the conversation
      * @param {string} role - "system", "user", or "assistant"
      * @param {Array} tokens - Array of {token_id, text} from tokenizer
+     * @param {Object} options - Options for persistence
+     * @param {boolean} options.waitForPersist - If true, await database persistence (default: false)
      */
-    addMessage(role, tokens) {
+    async addMessage(role, tokens, options = {}) {
         this.currentRole = role;
         this.currentSentenceId = 0;
-        
+
         for (const token of tokens) {
-            this._addToken(token.token_id, token.text);
+            await this._addToken(token.token_id, token.text, options);
         }
     }
 
     /**
      * Add a single streaming token during generation
+     * Fire-and-forget persistence for speed (DB writes async in background)
      * @param {number} tokenId - Token ID
      * @param {string} text - Token text
-     * @returns {Object} The created token
+     * @returns {Object} The created token (synchronously for rendering)
      */
     addStreamingToken(tokenId, text) {
-        return this._addToken(tokenId, text);
-    }
-
-    /**
-     * Internal: Add a single token
-     */
-    _addToken(tokenId, text) {
         const sentenceId = this.currentSentenceId;
-        
+
         const token = {
             token_id: tokenId,
             text: text,
             position: this.nextPosition++,
-            brightness: 255,  // Start bright (fail-safe)
+            brightness: 10000,  // Fail-bright: start high, prove relevance or decay
             turn_id: this.currentTurnId,
             role: this.currentRole,
             sentence_id: sentenceId,
             deleted: false,
             pinned: false
         };
-        
+
         this.tokens.push(token);
-        
+
+        // Fire-and-forget persistence (don't block streaming)
+        if (this.store) {
+            this.store.saveToken(token).catch(err => {
+                console.warn('Failed to persist streaming token:', err);
+            });
+        }
+
+        // Update cache
+        if (this._activeTokensCache !== null) {
+            this._activeTokensCache.push(token);
+            this._activeTokenCount++;
+        }
+
+        // Detect sentence boundaries
+        this._updateSentenceBoundary(text);
+
+        return token;
+    }
+
+    /**
+     * Internal: Add a single token
+     * @param {boolean} options.waitForPersist - If true, await database persistence (default: false for streaming performance)
+     */
+    async _addToken(tokenId, text, options = {}) {
+        const sentenceId = this.currentSentenceId;
+
+        const token = {
+            token_id: tokenId,
+            text: text,
+            position: this.nextPosition++,
+            brightness: 10000,  // Fail-bright: start high, prove relevance or decay
+            turn_id: this.currentTurnId,
+            role: this.currentRole,
+            sentence_id: sentenceId,
+            deleted: false,
+            pinned: false
+        };
+
+        this.tokens.push(token);
+
+        // Persist to IndexedDB
+        if (this.store) {
+            if (options.waitForPersist) {
+                // Block until persistence completes (for critical writes like user messages)
+                await this.store.saveToken(token);
+            } else {
+                // Fire-and-forget for streaming performance
+                this.store.saveToken(token).catch(err => {
+                    console.warn('Failed to persist token:', err);
+                });
+            }
+        }
+
         // SAFETY: Append-to-cache optimization is safe because:
         // 1. Tokens are only added via _addToken(), never modified during add
         // 2. New tokens always start with deleted=false
@@ -98,10 +248,10 @@ export class Conversation {
             this._activeTokensCache.push(token);
             this._activeTokenCount++;
         }
-        
+
         // Detect sentence boundaries for NEXT token
         this._updateSentenceBoundary(text);
-        
+
         return token;
     }
 
@@ -254,43 +404,57 @@ export class Conversation {
                 activeTokens.push(this.tokens[i]);
             }
         }
-        
+
         const contextLen = activeTokens.length;
         if (contextLen < 2) return;  // Need at least BOS + 1 token
-        
+
         // Use pre-aggregated data if available, otherwise aggregate client-side
-        const aggregated = attention.preAggregated 
-            ? attention.data 
+        const aggregated = attention.preAggregated
+            ? attention.data
             : this._aggregateAttention(attention);
-        
+
         // O(1) threshold calculation excluding BOS
         const bosAttention = aggregated[0];
         const threshold = (1.0 - bosAttention) / (contextLen - 1);
-        
+
         // Skip if threshold is invalid
         if (threshold <= 0 || !isFinite(threshold)) return;
-        
+
+        // Calculate mean brightness (excluding current turn)
+        let brightnessSum = 0;
+        let brightnessCount = 0;
+
+        for (let i = 0; i < this.tokens.length; i++) {
+            const token = this.tokens[i];
+            if (!token.deleted && token.turn_id !== this.currentTurnId) {
+                brightnessSum += token.brightness;
+                brightnessCount++;
+            }
+        }
+
+        // Update mean (should always have brightnessCount > 0 in practice)
+        this.meanBrightness = brightnessCount > 0 ? Math.floor(brightnessSum / brightnessCount) : 5000;
+
         // Update scores for non-BOS tokens (activeTokens[i] is already the token)
         // Skip current turn tokens - they're in their local attention wave
         const len = Math.min(aggregated.length, contextLen);
         for (let i = 1; i < len; i++) {
             const token = activeTokens[i];
-            
+
             // Skip current turn - these tokens get massive local attention
             // They'll start competing fairly on the next turn
             if (token.turn_id === this.currentTurnId) continue;
-            
+
             const att = aggregated[i];
-            
+
             if (att > threshold) {
                 // Strong reference: +ratio (e.g., 6.5x threshold → +6)
                 token.brightness += (att / threshold) | 0;  // Faster than Math.floor
                 // Cap at 10000 to prevent runaway scores
                 if (token.brightness > 10000) token.brightness = 10000;
             } else {
-                // Weak/no reference: 1% decay (proportional, not flat)
-                // High-brightness tokens decay faster in absolute terms
-                token.brightness -= Math.max(1, (token.brightness * 0.01) | 0);
+                // Weak/no reference: flat -1 decay
+                token.brightness -= 1;
             }
         }
     }
@@ -328,84 +492,218 @@ export class Conversation {
     // ========== Pruning ==========
 
     /**
+     * Check if a sentence is an S0 anchor and if it's protected from pruning
+     *
+     * Anchor Protection Rule:
+     * - S0 chunks are conversation anchors (opening of each turn)
+     * - For turn pairs (User Turn N → Assistant Turn N+1):
+     *   - UT_N S0 and AT_(N+1) S0 form an anchor pair
+     * - Anchors can ONLY be pruned when:
+     *   1. The anchor is the ONLY remaining chunk from its turn
+     *   2. Its paired anchor is ALSO the only remaining chunk from its turn
+     *   3. They prune together (atomically)
+     *
+     * This ensures any surviving chunk has conversational context.
+     */
+    _isAnchorProtected(sentence, sentences) {
+        // Only S0 chunks are anchors
+        if (sentence.sentence_id !== 0) return false;
+
+        // Check if this is the only remaining chunk from this turn
+        const turnChunks = sentences.filter(s =>
+            s.turn_id === sentence.turn_id &&
+            s.role === sentence.role &&
+            !s.fullyDeleted
+        );
+
+        if (turnChunks.length > 1) {
+            // Not the only chunk - anchor is protected
+            return true;
+        }
+
+        // This anchor is the only chunk from its turn
+        // Check if paired anchor exists and is also the only chunk
+
+        let pairedTurnId, pairedRole;
+
+        if (sentence.role === 'user') {
+            // User S0 pairs with Assistant S0 from next turn
+            pairedTurnId = sentence.turn_id + 1;
+            pairedRole = 'assistant';
+        } else if (sentence.role === 'assistant') {
+            // Assistant S0 pairs with User S0 from previous turn
+            pairedTurnId = sentence.turn_id - 1;
+            pairedRole = 'user';
+        } else {
+            // System messages have no pair
+            return false;
+        }
+
+        // Find the paired anchor
+        const pairedAnchor = sentences.find(s =>
+            s.turn_id === pairedTurnId &&
+            s.sentence_id === 0 &&
+            s.role === pairedRole &&
+            !s.fullyDeleted
+        );
+
+        if (!pairedAnchor) {
+            // No paired anchor exists (already deleted or doesn't exist)
+            return false;
+        }
+
+        // Check if paired anchor is also the only chunk from its turn
+        const pairedTurnChunks = sentences.filter(s =>
+            s.turn_id === pairedTurnId &&
+            s.role === pairedRole &&
+            !s.fullyDeleted
+        );
+
+        if (pairedTurnChunks.length > 1) {
+            // Paired anchor has siblings - both are protected
+            return true;
+        }
+
+        // Both anchors are solo - can be pruned together
+        return false;
+    }
+
+    /**
      * Prune lowest brightness sentences until under token budget
+     * Implements anchor protection: S0 chunks from turn pairs must be pruned together
      * @param {number} maxTokens - Maximum allowed active tokens
      * @returns {Array} Array of pruned sentence objects (for graveyard)
      */
     pruneToFit(maxTokens) {
         const prunedSentences = [];
-        
+
         // Check total active tokens (including current turn) against budget
         // Current turn is immune from deletion, but still counts toward the limit
         while (this.getActiveTokenCount() > maxTokens) {
             const sentences = this.getSentences();
-            
+
             // Find lowest prunable sentence in single pass
             let lowestSentence = null;
             let lowestPeak = Infinity;
             let prunableSentenceCount = 0;
-            
+
             for (let i = 0; i < sentences.length; i++) {
                 const s = sentences[i];
                 if (s.fullyDeleted) continue;
-                
+
                 // Skip current turn - immune until next generation
                 if (s.turn_id === this.currentTurnId) continue;
-                
+
                 // Skip system prompt (turn_id 0, role system) - never prune
                 if (s.turn_id === 0 && s.role === 'system') continue;
-                
+
                 // Skip pinned sentences
                 if (s.pinned) continue;
-                
+
+                // Skip anchor-protected sentences
+                if (this._isAnchorProtected(s, sentences)) continue;
+
                 prunableSentenceCount++;
-                
+
                 if (s.peakBrightness < lowestPeak) {
                     lowestPeak = s.peakBrightness;
                     lowestSentence = s;
                 }
             }
-            
+
             // Keep at least one prunable sentence
             if (prunableSentenceCount <= 1) break;
-            
+
             if (lowestSentence) {
-                this._deleteSentence(lowestSentence);
-                prunedSentences.push(lowestSentence);
+                // Check if this is an anchor that needs to be pruned with its pair
+                if (lowestSentence.sentence_id === 0 && (lowestSentence.role === 'user' || lowestSentence.role === 'assistant')) {
+                    // Find paired anchor and prune both together
+                    const pairedTurnId = lowestSentence.role === 'user'
+                        ? lowestSentence.turn_id + 1
+                        : lowestSentence.turn_id - 1;
+                    const pairedRole = lowestSentence.role === 'user' ? 'assistant' : 'user';
+
+                    const pairedAnchor = sentences.find(s =>
+                        s.turn_id === pairedTurnId &&
+                        s.sentence_id === 0 &&
+                        s.role === pairedRole &&
+                        !s.fullyDeleted
+                    );
+
+                    if (pairedAnchor) {
+                        // Prune both anchors atomically
+                        this._deleteSentence(lowestSentence);
+                        this._deleteSentence(pairedAnchor);
+                        prunedSentences.push(lowestSentence, pairedAnchor);
+                        console.log(`🔗 Pruned anchor pair: ${lowestSentence.role} turn ${lowestSentence.turn_id} + ${pairedAnchor.role} turn ${pairedAnchor.turn_id}`);
+                    } else {
+                        // Paired anchor doesn't exist, prune solo
+                        this._deleteSentence(lowestSentence);
+                        prunedSentences.push(lowestSentence);
+                    }
+                } else {
+                    // Regular chunk, prune normally
+                    this._deleteSentence(lowestSentence);
+                    prunedSentences.push(lowestSentence);
+                }
             } else {
                 break;
             }
         }
-        
+
         return prunedSentences;
     }
     
     /**
      * Resurrect a sentence from the graveyard (legacy - by position IDs)
+     * Semantic resurrection: preserve earned brightness (no gifts)
      * @param {Array<number>} tokenPositions - Position IDs of tokens to resurrect
      */
     resurrect(tokenPositions) {
         const positionSet = new Set(tokenPositions);
         let resurrectedCount = 0;
-        
+
+        // Group by chunk for efficient DB operations
+        const chunks = new Map(); // key: turn_sentence_role → {turn_id, sentence_id, role, tokens}
+
         for (const token of this.tokens) {
             if (positionSet.has(token.position) && token.deleted) {
                 token.deleted = false;
-                // Keep earned brightness if higher than floor
-                token.brightness = Math.max(255, token.brightness_at_deletion || 255);
+                // Semantic resurrection: keep earned brightness (token already has brightness_at_deletion)
+                // Resurrection is just a chance to earn MORE attention, not a boost
+                if (token.brightness_at_deletion !== undefined) {
+                    token.brightness = token.brightness_at_deletion;
+                }
+                // If no brightness_at_deletion, keep current brightness (shouldn't happen)
                 resurrectedCount++;
+
+                // Collect for chunk-based DB operation
+                const key = `${token.turn_id}_${token.sentence_id}_${token.role}`;
+                if (!chunks.has(key)) {
+                    chunks.set(key, { turn_id: token.turn_id, sentence_id: token.sentence_id, role: token.role });
+                }
             }
         }
-        
+
+        // Persist chunk resurrection to IndexedDB (move from dead to live, brightness already preserved)
+        if (this.store && chunks.size > 0) {
+            for (const chunk of chunks.values()) {
+                this.store.resurrectChunk(chunk.turn_id, chunk.sentence_id, chunk.role).catch(err => {
+                    console.warn('Failed to persist chunk resurrection:', err);
+                });
+            }
+        }
+
         if (resurrectedCount > 0) {
             this._invalidateCache();
         }
-        
+
         return resurrectedCount;
     }
     
     /**
      * Resurrect a chunk by tuple (for semantic index)
+     * Semantic resurrection: preserve earned brightness (no gifts)
      * @param {number} turn_id - Turn ID
      * @param {number} sentence_id - Sentence/chunk ID
      * @param {string} role - Role ("system", "user", "assistant")
@@ -413,28 +711,40 @@ export class Conversation {
      */
     resurrectByTuple(turn_id, sentence_id, role) {
         let resurrectedCount = 0;
-        
+
         for (const token of this.tokens) {
-            if (token.turn_id === turn_id && 
-                token.sentence_id === sentence_id && 
+            if (token.turn_id === turn_id &&
+                token.sentence_id === sentence_id &&
                 token.role === role &&
                 token.deleted) {
                 token.deleted = false;
-                // Keep earned brightness if higher than floor
-                token.brightness = Math.max(255, token.brightness_at_deletion || 255);
+                // Semantic resurrection: keep earned brightness
+                // Resurrection is just a chance to earn MORE attention, not a boost
+                if (token.brightness_at_deletion !== undefined) {
+                    token.brightness = token.brightness_at_deletion;
+                }
+                // If no brightness_at_deletion, keep current brightness (shouldn't happen)
                 resurrectedCount++;
             }
         }
-        
+
+        // Persist chunk resurrection to IndexedDB (move from dead to live, brightness already preserved)
+        if (this.store && resurrectedCount > 0) {
+            this.store.resurrectChunk(turn_id, sentence_id, role).catch(err => {
+                console.warn('Failed to persist chunk resurrection:', err);
+            });
+        }
+
         if (resurrectedCount > 0) {
             this._invalidateCache();
         }
-        
+
         return resurrectedCount;
     }
     
     /**
      * Toggle pinned state for all tokens in a sentence
+     * Manual resurrection: starts at 10k (strongest user signal)
      * @param {number} turn_id - Turn ID
      * @param {number} sentence_id - Sentence/chunk ID
      * @param {string} role - Role
@@ -444,37 +754,37 @@ export class Conversation {
         // First, determine current state (pinned if ANY token is pinned)
         let currentlyPinned = false;
         for (const token of this.tokens) {
-            if (token.turn_id === turn_id && 
-                token.sentence_id === sentence_id && 
+            if (token.turn_id === turn_id &&
+                token.sentence_id === sentence_id &&
                 token.role === role &&
                 token.pinned) {
                 currentlyPinned = true;
                 break;
             }
         }
-        
+
         // Toggle all tokens in this sentence
         const newState = !currentlyPinned;
         let resurrected = false;
         for (const token of this.tokens) {
-            if (token.turn_id === turn_id && 
-                token.sentence_id === sentence_id && 
+            if (token.turn_id === turn_id &&
+                token.sentence_id === sentence_id &&
                 token.role === role) {
                 token.pinned = newState;
-                // Pinning also resurrects deleted tokens
+                // Pinning also resurrects deleted tokens at 10k (strongest signal)
                 if (newState && token.deleted) {
                     token.deleted = false;
-                    // Keep earned brightness if higher than floor
-                    token.brightness = Math.max(255, token.brightness_at_deletion || 255);
+                    // Manual pin/resurrection: start at 10k (user declared importance)
+                    token.brightness = 10000;
                     resurrected = true;
                 }
             }
         }
-        
+
         if (resurrected) {
             this._invalidateCache();
         }
-        
+
         return newState;
     }
     
@@ -573,8 +883,58 @@ export class Conversation {
                 token.brightness_at_deletion = token.brightness;
             }
         }
+
+        // Persist chunk pruning to IndexedDB (move from live to dead)
+        if (this.store) {
+            this.store.pruneChunk(sentence.turn_id, sentence.sentence_id, sentence.role).catch(err => {
+                console.warn('Failed to persist chunk pruning:', err);
+            });
+        }
+
         // Invalidate cache after deletion
         this._invalidateCache();
+    }
+
+    /**
+     * Delete all tokens in a turn (user-initiated deletion)
+     * @param {number} turn_id - Turn ID to delete
+     * @returns {number} Number of tokens deleted
+     */
+    deleteTurn(turn_id) {
+        let deletedCount = 0;
+
+        for (const token of this.tokens) {
+            if (token.turn_id === turn_id && !token.deleted) {
+                token.deleted = true;
+                token.brightness_at_deletion = token.brightness;
+                deletedCount++;
+            }
+        }
+
+        // Persist to IndexedDB (prune all chunks from this turn)
+        if (this.store && deletedCount > 0) {
+            const sentences = this.getSentences().filter(s => s.turn_id === turn_id);
+            for (const sentence of sentences) {
+                this.store.pruneChunk(turn_id, sentence.sentence_id, sentence.role).catch(err => {
+                    console.warn('Failed to persist turn deletion:', err);
+                });
+            }
+        }
+
+        // Invalidate cache
+        this._invalidateCache();
+
+        return deletedCount;
+    }
+
+    /**
+     * Reconstruct text from all tokens in a turn
+     * @param {number} turn_id - Turn ID
+     * @returns {string} Reconstructed text
+     */
+    reconstructTurnText(turn_id) {
+        const turnTokens = this.tokens.filter(t => t.turn_id === turn_id);
+        return this.reconstructText(turnTokens);
     }
 
     /**

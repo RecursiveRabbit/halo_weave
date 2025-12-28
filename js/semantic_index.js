@@ -18,9 +18,12 @@ let embeddingModel = null;
 
 export class SemanticIndex {
     constructor(options = {}) {
-        // Append-only entry list
+        // Append-only entry list (in-memory, backed by IndexedDB)
         this.entries = [];
-        
+
+        // Persistent storage
+        this.store = options.store || null;  // PersistentStore instance
+
         // Configuration
         this.embeddingDim = 384;  // all-MiniLM-L6-v2 output dimension
         this.embeddingContextTokens = options.embeddingContextTokens || 256;
@@ -296,57 +299,133 @@ export class SemanticIndex {
             this.entries.push(entry);
             this._indexedChunks.add(key);
             this.totalIndexed++;
-            
+
             // Queue embedding (processed sequentially to avoid WASM contention)
             this._queueEmbedding(entry, contextText);
         }
     }
 
     /**
-     * Build context window for embedding (N-1, N, N+1, ... up to token budget)
+     * Load all semantic entries from IndexedDB into memory
+     * Call this on startup to restore the full index
+     */
+    async loadFromStore() {
+        if (!this.store) {
+            console.warn('📚 No persistent store configured, skipping load');
+            return;
+        }
+
+        console.log('📚 Loading semantic index from IndexedDB...');
+        const t0 = performance.now();
+
+        const entries = await this.store.getAllSemanticEntries();
+
+        this.entries = entries;
+        this._indexedChunks.clear();
+        for (const e of entries) {
+            this._indexedChunks.add(this._chunkKey(e.turn_id, e.sentence_id, e.role));
+        }
+
+        const elapsed = performance.now() - t0;
+        console.log(`📚 Loaded ${entries.length} entries in ${elapsed.toFixed(0)}ms`);
+    }
+
+    /**
+     * Persist a semantic entry to IndexedDB after embedding
+     */
+    async _persistEntry(entry) {
+        if (!this.store || !entry.embedding) return;
+
+        try {
+            await this.store.saveSemanticEntry(entry);
+        } catch (err) {
+            console.warn('📚 Failed to persist entry to IndexedDB:', err);
+        }
+    }
+
+    /**
+     * Build context window for embedding using turn-pair strategy
+     *
+     * Strategy:
+     * - Assistant chunks: embed with user sentence_0 from turn N-1, assistant sentence_0 from turn N
+     * - User chunks: embed with user sentence_0 from turn N, assistant sentence_0 from turn N+1
+     * - System chunks: embed in isolation
+     *
+     * This captures conversational structure (Q→A pairs) rather than sequential proximity.
      */
     _buildContextWindow(targetSentence, allSentences, conversation) {
-        // Sort sentences by position (turn_id, then sentence_id, then role for stability)
-        const roleNum = { system: 0, user: 1, assistant: 2 };
-        const sorted = [...allSentences].sort((a, b) => {
-            if (a.turn_id !== b.turn_id) return a.turn_id - b.turn_id;
-            if (a.sentence_id !== b.sentence_id) return a.sentence_id - b.sentence_id;
-            return (roleNum[a.role] || 0) - (roleNum[b.role] || 0);
-        });
-        
-        // Find target index
-        const targetIdx = sorted.findIndex(s => 
-            s.turn_id === targetSentence.turn_id && 
-            s.sentence_id === targetSentence.sentence_id &&
-            s.role === targetSentence.role
-        );
-        
-        if (targetIdx === -1) {
+        const targetTurn = targetSentence.turn_id;
+        const targetRole = targetSentence.role;
+
+        // System chunks embed in isolation (no turn pair)
+        if (targetRole === 'system') {
             return conversation.reconstructText(targetSentence.tokens);
         }
-        
-        // Start with target
-        const chunks = [targetSentence];
-        let totalTokens = targetSentence.tokens.length;
-        
-        // Add N-1 if room
-        if (targetIdx > 0) {
-            const prev = sorted[targetIdx - 1];
-            if (totalTokens + prev.tokens.length <= this.embeddingContextTokens) {
-                chunks.unshift(prev);
-                totalTokens += prev.tokens.length;
+
+        // Build sentence lookup by (turn_id, sentence_id, role)
+        const sentenceLookup = new Map();
+        for (const s of allSentences) {
+            const key = `${s.turn_id}_${s.sentence_id}_${s.role}`;
+            sentenceLookup.set(key, s);
+        }
+
+        // Helper to get sentence_0 of a turn
+        const getSentence0 = (turnId, role) => {
+            const key = `${turnId}_0_${role}`;
+            return sentenceLookup.get(key);
+        };
+
+        const chunks = [];
+        let totalTokens = 0;
+
+        // Strategy for Assistant chunks
+        if (targetRole === 'assistant') {
+            // 1. Add user sentence_0 from previous turn (the question)
+            const userS0 = getSentence0(targetTurn - 1, 'user');
+            if (userS0 && totalTokens + userS0.tokens.length <= this.embeddingContextTokens) {
+                chunks.push(userS0);
+                totalTokens += userS0.tokens.length;
+            }
+
+            // 2. Add assistant sentence_0 from current turn (opening of response)
+            // Only add if target is NOT sentence_0
+            if (targetSentence.sentence_id !== 0) {
+                const assistantS0 = getSentence0(targetTurn, 'assistant');
+                if (assistantS0 && totalTokens + assistantS0.tokens.length <= this.embeddingContextTokens) {
+                    chunks.push(assistantS0);
+                    totalTokens += assistantS0.tokens.length;
+                }
+            }
+
+            // 3. Add target chunk
+            chunks.push(targetSentence);
+            totalTokens += targetSentence.tokens.length;
+        }
+        // Strategy for User chunks
+        else if (targetRole === 'user') {
+            // 1. Add user sentence_0 from current turn (opening of question)
+            // Only add if target is NOT sentence_0
+            if (targetSentence.sentence_id !== 0) {
+                const userS0 = getSentence0(targetTurn, 'user');
+                if (userS0 && totalTokens + userS0.tokens.length <= this.embeddingContextTokens) {
+                    chunks.push(userS0);
+                    totalTokens += userS0.tokens.length;
+                }
+            }
+
+            // 2. Add target chunk
+            chunks.push(targetSentence);
+            totalTokens += targetSentence.tokens.length;
+
+            // 3. Add assistant sentence_0 from next turn (the response)
+            const assistantS0 = getSentence0(targetTurn + 1, 'assistant');
+            if (assistantS0 && totalTokens + assistantS0.tokens.length <= this.embeddingContextTokens) {
+                chunks.push(assistantS0);
+                totalTokens += assistantS0.tokens.length;
             }
         }
-        
-        // Add N+1, N+2, ... while room
-        for (let i = targetIdx + 1; i < sorted.length; i++) {
-            const next = sorted[i];
-            if (totalTokens + next.tokens.length > this.embeddingContextTokens) break;
-            chunks.push(next);
-            totalTokens += next.tokens.length;
-        }
-        
-        // Reconstruct text from all chunks
+
+        // Reconstruct text from chunks (in order added)
         return chunks.map(s => conversation.reconstructText(s.tokens)).join(' ');
     }
 
@@ -364,16 +443,19 @@ export class SemanticIndex {
     async _processEmbedQueue() {
         if (this._embedProcessing) return;
         this._embedProcessing = true;
-        
+
         while (this._embedQueue.length > 0) {
             const { entry, contextText } = this._embedQueue.shift();
             try {
                 entry.embedding = await this.embed(contextText);
+
+                // Persist to IndexedDB after successful embedding
+                await this._persistEntry(entry);
             } catch (err) {
                 console.warn('📚 Embedding failed for entry:', entry.text.substring(0, 30));
             }
         }
-        
+
         this._embedProcessing = false;
     }
 
@@ -455,24 +537,53 @@ export class SemanticIndex {
     }
 
     /**
-     * Delete an entry from the index
+     * Delete an entry from the index (both memory and IndexedDB)
+     * Used for re-indexing operations
      * @param {number} turn_id - Turn ID
      * @param {number} sentence_id - Sentence/chunk ID
      * @param {string} role - Role
      * @returns {boolean} True if entry was found and deleted
      */
-    deleteEntry(turn_id, sentence_id, role) {
+    async deleteEntry(turn_id, sentence_id, role) {
         const key = this._chunkKey(turn_id, sentence_id, role);
-        const idx = this.entries.findIndex(e => 
+        const idx = this.entries.findIndex(e =>
             this._chunkKey(e.turn_id, e.sentence_id, e.role) === key
         );
-        
+
         if (idx !== -1) {
             this.entries.splice(idx, 1);
+
+            // Delete from IndexedDB
+            if (this.store) {
+                try {
+                    await this.store.deleteSemanticEntry(turn_id, sentence_id, role);
+                } catch (err) {
+                    console.warn('📚 Failed to delete entry from IndexedDB:', err);
+                }
+            }
+
             console.log(`📚 Deleted index entry for turn ${turn_id}, sentence ${sentence_id}`);
             return true;
         }
         return false;
+    }
+
+    /**
+     * Delete chunk from search (user-initiated deletion)
+     * Removes embedding but preserves token transcript
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence/chunk ID
+     * @param {string} role - Role
+     */
+    async deleteChunkFromSearch(turn_id, sentence_id, role) {
+        // Delete embedding from semantic index
+        await this.deleteEntry(turn_id, sentence_id, role);
+
+        // Mark as indexed so it won't be re-indexed
+        const key = this._chunkKey(turn_id, sentence_id, role);
+        this._indexedChunks.add(key);
+
+        console.log(`📚 Removed chunk from search: turn ${turn_id}, sentence ${sentence_id}, ${role}`);
     }
     
     /**

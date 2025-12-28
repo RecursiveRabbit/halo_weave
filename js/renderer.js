@@ -46,47 +46,64 @@ export class Renderer {
      * Update colors for all visible tokens (debounced with rAF)
      * Only updates tokens whose visual appearance has actually changed
      * @param {Conversation} conversation
+     * @param {Object} options - Optional brightness range for dynamic scaling
+     * @param {number} options.minBrightness - Minimum brightness in active context
+     * @param {number} options.maxBrightness - Maximum brightness in active context
      */
-    updateColors(conversation) {
-        // Store conversation for rAF callback
+    updateColors(conversation, options = {}) {
+        // Store conversation and options for rAF callback
         this._pendingConversation = conversation;
-        
+        this._pendingOptions = options;
+
         // Coalesce multiple calls per frame
         if (this.pendingUpdate) return;
         this.pendingUpdate = true;
-        
+
         requestAnimationFrame(() => {
-            this._doUpdateColors(this._pendingConversation);
+            this._doUpdateColors(this._pendingConversation, this._pendingOptions);
             this.pendingUpdate = false;
         });
     }
 
     /**
      * Actual color update logic - only updates changed tokens
+     * @param {Conversation} conversation
+     * @param {Object} options - Brightness range for dynamic scaling
      */
-    _doUpdateColors(conversation) {
+    _doUpdateColors(conversation, options = {}) {
         const sentences = conversation.getSentences();
-        
+
+        // Get brightness range for dynamic scaling
+        // If not provided, fall back to stats calculation
+        let minB = options.minBrightness;
+        let maxB = options.maxBrightness;
+
+        if (minB === undefined || maxB === undefined) {
+            const stats = conversation.getStats();
+            minB = stats.minBrightness;
+            maxB = stats.maxBrightness;
+        }
+
         for (let s = 0; s < sentences.length; s++) {
             const sentence = sentences[s];
             if (sentence.fullyDeleted) continue;
-            
+
             // peakBrightness already computed by getSentences()
             const peakBrightness = sentence.peakBrightness;
             if (peakBrightness === -Infinity) continue;  // No active tokens
-            
+
             // Numeric key matching conversation.js format
             const roleNum = { system: 0, user: 1, assistant: 2 };
             const sentenceKey = sentence.turn_id * 1000000 + sentence.sentence_id * 10 + (roleNum[sentence.role] || 0);
-            
+
             // Check if paragraph peak changed (affects all non-bright tokens)
             const lastPeak = this.lastParagraphPeak.get(sentenceKey);
             const peakChanged = lastPeak !== peakBrightness;
             if (peakChanged) {
                 this.lastParagraphPeak.set(sentenceKey, peakBrightness);
             }
-            
-            const paragraphColor = this._brightnessToYellow(peakBrightness);
+
+            const paragraphColor = this._brightnessToYellow(peakBrightness, minB, maxB);
             
             for (const token of sentence.tokens) {
                 const el = this.tokenElements.get(token.position);
@@ -101,21 +118,26 @@ export class Renderer {
                 
                 const lastB = this.lastBrightness.get(token.position);
                 const currentB = token.brightness;
-                
+
+                // Calculate brightness threshold for "bright" tokens (top 20% of range)
+                const brightThreshold = minB + (maxB - minB) * 0.8;
+                const isBright = currentB >= brightThreshold;
+                const wasBright = lastB !== undefined && lastB >= brightThreshold;
+
                 // Skip if this token's brightness hasn't changed
                 // AND the paragraph peak hasn't changed (which affects non-bright tokens)
-                const isBright = currentB > 255;
-                const wasBright = lastB !== undefined && lastB > 255;
-                
                 if (lastB === currentB && !peakChanged) continue;
                 if (!isBright && !wasBright && !peakChanged) continue;
-                
+
                 this.lastBrightness.set(token.position, currentB);
-                
-                // Bright tokens (above baseline) get white text + yellow background
+
+                // Bright tokens (top 20%) get white text + yellow background
                 if (isBright) {
                     el.style.color = '#ffffff';
-                    const highlightAlpha = Math.min(0.5, (currentB - 255) / 1000 * 0.5);
+                    // Alpha based on position within top 20% (0.2 to 0.5)
+                    const topRangeSize = maxB - brightThreshold;
+                    const positionInTopRange = topRangeSize > 0 ? (currentB - brightThreshold) / topRangeSize : 1;
+                    const highlightAlpha = 0.2 + positionInTopRange * 0.3;
                     el.style.backgroundColor = `rgba(255, 200, 50, ${highlightAlpha.toFixed(3)})`;
                 } else {
                     // Normal tokens get paragraph yellow shade
@@ -256,7 +278,24 @@ export class Renderer {
             }
         });
         span.appendChild(pinBtn);
-        
+
+        // Add delete button
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-btn';
+        deleteBtn.textContent = '❌';
+        deleteBtn.title = 'Delete chunk from search index';
+        deleteBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (this.onDelete) {
+                this.onDelete(
+                    parseInt(span.dataset.turnId),
+                    parseInt(span.dataset.sentenceId),
+                    span.dataset.role
+                );
+            }
+        });
+        span.appendChild(deleteBtn);
+
         turnEl.appendChild(span);
         this.sentenceElements.set(key, span);
         return span;
@@ -306,34 +345,46 @@ export class Renderer {
     }
 
     /**
-     * Convert brightness to yellow text color
-     * Dim = dark yellow/olive, bright = golden yellow
+     * Convert brightness to yellow text color using dynamic scale
+     * Maps min→max brightness to dim olive → bright gold gradient
      * @param {number} brightness - Brightness score
+     * @param {number} minBrightness - Minimum brightness in context (darkest)
+     * @param {number} maxBrightness - Maximum brightness in context (brightest)
      * @returns {string} CSS color string
      */
-    _brightnessToYellow(brightness) {
-        // Map brightness to yellow intensity
-        // 0 -> dim olive (100, 90, 40)
-        // 255 -> medium yellow (200, 180, 80)
-        // 500+ -> bright gold (255, 220, 100)
-        
-        const b = Math.max(0, brightness);
-        
-        if (b <= 255) {
-            // 0-255: olive to medium yellow
-            const t = b / 255;
-            const r = Math.round(100 + t * 100);  // 100 -> 200
-            const g = Math.round(90 + t * 90);    // 90 -> 180
-            const blue = Math.round(40 + t * 40); // 40 -> 80
-            return `rgb(${r}, ${g}, ${blue})`;
-        } else {
-            // 255+: medium yellow to bright gold
-            const excess = Math.min(b - 255, 500) / 500;  // Cap at 755
-            const r = Math.round(200 + excess * 55);   // 200 -> 255
-            const g = Math.round(180 + excess * 40);   // 180 -> 220
-            const blue = Math.round(80 + excess * 20); // 80 -> 100
-            return `rgb(${r}, ${g}, ${blue})`;
+    _brightnessToYellow(brightness, minBrightness, maxBrightness) {
+        // Handle edge cases
+        if (minBrightness === maxBrightness) {
+            // All tokens have same brightness - use medium yellow
+            return 'rgb(200, 180, 80)';
         }
+
+        // Normalize brightness to 0-1 range based on actual min/max
+        const range = maxBrightness - minBrightness;
+        const normalized = Math.max(0, Math.min(1, (brightness - minBrightness) / range));
+
+        // Map to color gradient:
+        // 0.0 (min) -> dim olive   (100, 90, 40)
+        // 0.5 (mid) -> medium yellow (200, 180, 80)
+        // 1.0 (max) -> bright gold  (255, 220, 100)
+
+        let r, g, blue;
+
+        if (normalized <= 0.5) {
+            // 0.0-0.5: olive to medium yellow
+            const t = normalized * 2;  // 0→1
+            r = Math.round(100 + t * 100);   // 100 → 200
+            g = Math.round(90 + t * 90);     // 90 → 180
+            blue = Math.round(40 + t * 40);  // 40 → 80
+        } else {
+            // 0.5-1.0: medium yellow to bright gold
+            const t = (normalized - 0.5) * 2;  // 0→1
+            r = Math.round(200 + t * 55);    // 200 → 255
+            g = Math.round(180 + t * 40);    // 180 → 220
+            blue = Math.round(80 + t * 20);  // 80 → 100
+        }
+
+        return `rgb(${r}, ${g}, ${blue})`;
     }
 
     /**

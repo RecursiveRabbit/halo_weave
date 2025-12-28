@@ -88,6 +88,7 @@
                     <span>Tokens: <strong id="stat-tokens">0</strong></span>
                     <span>Brightness: <strong id="stat-brightness">-</strong></span>
                     <span>Pruned: <strong id="stat-pruned">0</strong></span>
+                    <button id="btn-toggle-graveyard" class="btn btn-small" title="Toggle Graveyard">⚰️</button>
                 </div>
 
                 <!-- Input -->
@@ -96,6 +97,16 @@
                     <button id="btn-send" class="btn btn-primary">Send</button>
                 </div>
             </main>
+
+            <!-- Graveyard Sidebar (Right) -->
+            <aside id="graveyard" class="graveyard collapsed">
+                <div class="graveyard-header">
+                    <h2>⚰️ Graveyard</h2>
+                </div>
+                <div id="graveyard-content" class="graveyard-content">
+                    <p class="hint">Pruned chunks appear here. Click to resurrect.</p>
+                </div>
+            </aside>
         </div>
     </div>
 

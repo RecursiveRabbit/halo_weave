@@ -13,15 +13,19 @@ import { Conversation } from './conversation.js';
 import { Renderer } from './renderer.js';
 import { DataCapture } from './data_capture.js';
 import { SemanticIndex } from './semantic_index.js';
+import { PersistentStore } from './persistent_store.js';
 
 class App {
     constructor() {
+        // Persistent storage (shared across components)
+        this.store = new PersistentStore();
+
         // Core components
         this.client = new KoboldClient('http://127.0.0.1:5001');
-        this.conversation = new Conversation();
+        this.conversation = new Conversation({ store: this.store });
         this.renderer = new Renderer(document.getElementById('tokens'));
         this.capture = new DataCapture();
-        this.semanticIndex = new SemanticIndex();
+        this.semanticIndex = new SemanticIndex({ store: this.store });
         
         // Wire up renderer callbacks
         this.renderer.onPinToggle = (turnId, sentenceId, role) => {
@@ -36,19 +40,23 @@ class App {
             // Merge tokens in conversation (finds previous non-empty sentence)
             const { success, targetSentenceId } = this.conversation.mergeSentenceIntoPrevious(turnId, sentenceId, role);
             if (!success) return;
-            
+
             // Delete old entries from semantic index
             this.semanticIndex.deleteEntry(turnId, sentenceId, role);
             this.semanticIndex.deleteEntry(turnId, targetSentenceId, role);
-            
+
             // Re-index the merged chunk
             await this.semanticIndex.reindexChunk(this.conversation, turnId, targetSentenceId, role);
-            
+
             // Rebuild renderer
             this.renderer.rebuild(this.conversation);
             this._updateStats();
-            
+
             console.log(`✅ Merged sentence ${sentenceId} into ${targetSentenceId}`);
+        };
+
+        this.renderer.onDelete = async (turnId, sentenceId, role) => {
+            await this._handleDeleteChunk(turnId, sentenceId, role);
         };
         
         // State
@@ -81,7 +89,10 @@ class App {
             captureStatus: document.getElementById('capture-status'),
             statTokens: document.getElementById('stat-tokens'),
             statBrightness: document.getElementById('stat-brightness'),
-            statPruned: document.getElementById('stat-pruned')
+            statPruned: document.getElementById('stat-pruned'),
+            graveyard: document.getElementById('graveyard'),
+            graveyardContent: document.getElementById('graveyard-content'),
+            btnToggleGraveyard: document.getElementById('btn-toggle-graveyard')
         };
         
         this._bindEvents();
@@ -89,8 +100,42 @@ class App {
     }
 
     async _init() {
-        this._setStatus('Connecting...', '');
-        
+        this._setStatus('Initializing...', '');
+
+        // Initialize IndexedDB
+        try {
+            await this.store.init();
+            console.log('💾 IndexedDB initialized');
+        } catch (err) {
+            console.error('Failed to initialize IndexedDB:', err);
+            this._setStatus('Database error - check console', 'error');
+            return;
+        }
+
+        // Load conversation metadata (nextPosition, nextTurn)
+        await this.conversation.loadMetadataFromStore();
+
+        // Load semantic index from IndexedDB
+        this._setStatus('Loading conversation history...', '');
+        await this.semanticIndex.loadFromStore();
+
+        // Load all live tokens from IndexedDB
+        await this.conversation.loadAllLiveTokensFromStore();
+
+        // Render the conversation in the UI
+        if (this.conversation.tokens.length > 0) {
+            this.renderer.rebuild(this.conversation);
+            console.log('🎨 Rendered persisted conversation');
+        }
+
+        // Show database stats
+        const dbStats = await this.store.getStats();
+        console.log(`💾 Database: ${dbStats.liveTokens} live + ${dbStats.deadTokens} dead = ${dbStats.totalTokens} total tokens`);
+        console.log(`💾 Semantic: ${dbStats.semanticEntries} indexed chunks`);
+        console.log(`💾 Next position: ${dbStats.nextPosition}, Next turn: ${dbStats.nextTurn}`);
+
+        this._setStatus('Connecting to model...', '');
+
         try {
             const modelInfo = await this.client.getModelInfo();
 
@@ -100,10 +145,10 @@ class App {
             this._setStatus('Connection failed - is KoboldCPP running?', 'error');
             console.error('Connection error:', err);
         }
-        
+
         this._loadSettings();
         this._updateStats();
-        
+
         // Preload embedding model in background (avoids lag on first message)
         this.semanticIndex.preloadModel().catch(err => {
             console.warn('Embedding model preload failed:', err);
@@ -147,7 +192,10 @@ class App {
         
         // Check capture server availability on load
         this._checkCaptureServer();
-        
+
+        // Graveyard toggle
+        this.elements.btnToggleGraveyard.addEventListener('click', () => this._toggleGraveyard());
+
         // Save settings on change
         ['maxTokens', 'temperature', 'topP', 'maxContext', 'systemPrompt'].forEach(key => {
             this.elements[key].addEventListener('change', () => this._saveSettings());
@@ -194,7 +242,10 @@ class App {
             
             // End assistant turn
             this.conversation.nextTurn();
-            
+
+            // Save metadata after turn completes
+            await this.conversation.saveMetadataToStore();
+
         } catch (err) {
             console.error('Generation error:', err);
             this._setStatus('Generation failed: ' + err.message, 'error');
@@ -207,39 +258,31 @@ class App {
     
     /**
      * Query semantic index and resurrect relevant pruned context
+     * Universal equation: budget = model_max - current_context - user_prompt - generation_max
      * @param {string} userText - The user's message text
      */
     async _resurrectRelevantContext(userText) {
-        // Calculate available space dynamically:
-        // availableSpace = maxContext - currentTokens - maxNewTokens - userMessageTokens
-        // Use model's actual context limit, fall back to fixed 512 budget
         const modelMaxContext = this.client.modelInfo?.max_context_length;
-        const estimatedUserTokens = Math.ceil(userText.length / 4);  // Rough estimate
-        
-        let tokenBudget;
-        if (modelMaxContext) {
-            const maxNewTokens = parseInt(this.elements.maxTokens.value);
-            const currentTokens = this.conversation.getActiveTokenCount();
-            tokenBudget = Math.max(0, modelMaxContext - currentTokens - maxNewTokens - estimatedUserTokens);
-        } else {
-            // Fallback: fixed budget minus user message
-            tokenBudget = Math.max(0, 512 - estimatedUserTokens);
+        if (!modelMaxContext) {
+            console.warn('📚 Model max context not available, skipping resurrection');
+            return;
         }
-        
+
+        const estimatedUserTokens = Math.ceil(userText.length / 4);  // Rough estimate
+        const maxNewTokens = parseInt(this.elements.maxTokens.value);
+        const currentTokens = this.conversation.getActiveTokenCount();
+
+        // Universal resurrection budget equation
+        const tokenBudget = Math.max(0, modelMaxContext - currentTokens - estimatedUserTokens - maxNewTokens);
+
         const idxStats = this.semanticIndex.getStats();
         console.log(`\n📚 RESURRECTION QUERY`);
         console.log(`   Index size: ${idxStats.entries} chunks (${idxStats.embedded} embedded)`);
         console.log(`   Query: "${userText.substring(0, 60)}${userText.length > 60 ? '...' : ''}"`);
-        if (modelMaxContext) {
-            const maxNewTokens = parseInt(this.elements.maxTokens.value);
-            const currentTokens = this.conversation.getActiveTokenCount();
-            console.log(`   Space calc: ${modelMaxContext} max - ${currentTokens} current - ${maxNewTokens} gen - ${estimatedUserTokens} user = ${tokenBudget} available`);
-        } else {
-            console.log(`   Token budget: ${tokenBudget} (fallback mode)`);
-        }
-        
+        console.log(`   Budget: ${modelMaxContext} max - ${currentTokens} current - ${estimatedUserTokens} user - ${maxNewTokens} gen = ${tokenBudget} available`);
+
         if (tokenBudget <= 0) {
-            console.log(`   Result: No budget (user message too long)`);
+            console.log(`   Result: No budget available`);
             return;
         }
         
@@ -259,16 +302,24 @@ class App {
         // Paired resurrection preserves conversation structure:
         // - User chunks bring assistant sentence 0 from next turn (the response)
         // - Assistant chunks bring user sentence 0 from previous turn (the question)
-        // NOTE: If multiple chunks from same turn match, we may over-reserve budget
-        // for the shared pair. Not worth the complexity to fix this edge case.
+        this._setStatus('Searching conversation history...', '');
+
         let totalResurrected = 0;
         let tokensUsed = 0;
         const resurrectedChunks = [];
         const skippedAlive = [];
         const skippedBudget = [];
-        
-        // Helper to find conversational pair from semantic index
-        const findPair = (match) => {
+        const positionsToLoad = new Set();  // Positions that need loading from IndexedDB
+
+        // Helper to find conversational pairs from semantic index
+        // Returns: { crossTurnPair, sameTurnS0 }
+        const findPairs = (match) => {
+            const pairs = { crossTurnPair: null, sameTurnS0: null };
+
+            // System chunks don't pair
+            if (match.role === 'system') return pairs;
+
+            // 1. Cross-turn pair (sentence_0 from other role's turn)
             let pairTurn, pairRole;
             if (match.role === 'user') {
                 pairTurn = match.turn_id + 1;
@@ -276,74 +327,177 @@ class App {
             } else if (match.role === 'assistant') {
                 pairTurn = match.turn_id - 1;
                 pairRole = 'user';
-            } else {
-                return null; // system chunks don't pair
             }
-            
-            // Look up pair in semantic index to get token count
-            const pairEntry = this.semanticIndex.entries.find(e => 
+
+            const crossEntry = this.semanticIndex.entries.find(e =>
                 e.turn_id === pairTurn && e.sentence_id === 0 && e.role === pairRole
             );
-            
-            if (!pairEntry) return null;
-            
-            return {
-                turn_id: pairTurn,
-                sentence_id: 0,
-                role: pairRole,
-                tokenCount: pairEntry.tokenCount
-            };
+
+            if (crossEntry) {
+                pairs.crossTurnPair = {
+                    turn_id: pairTurn,
+                    sentence_id: 0,
+                    role: pairRole,
+                    tokenCount: crossEntry.tokenCount
+                };
+            }
+
+            // 2. Same-turn sentence_0 (only if target is NOT sentence_0)
+            if (match.sentence_id !== 0) {
+                const sameTurnEntry = this.semanticIndex.entries.find(e =>
+                    e.turn_id === match.turn_id && e.sentence_id === 0 && e.role === match.role
+                );
+
+                if (sameTurnEntry) {
+                    pairs.sameTurnS0 = {
+                        turn_id: match.turn_id,
+                        sentence_id: 0,
+                        role: match.role,
+                        tokenCount: sameTurnEntry.tokenCount
+                    };
+                }
+            }
+
+            return pairs;
         };
-        
+
+        // First pass: determine what to resurrect and collect positions to load
         for (const match of matches) {
-            // Skip if chunk is already alive
-            if (this.conversation.isChunkAlive(match.turn_id, match.sentence_id, match.role)) {
+            // Check if chunk is already in memory and alive
+            const inMemory = this.conversation.tokens.some(t =>
+                t.turn_id === match.turn_id &&
+                t.sentence_id === match.sentence_id &&
+                t.role === match.role
+            );
+
+            if (inMemory && this.conversation.isChunkAlive(match.turn_id, match.sentence_id, match.role)) {
                 skippedAlive.push(match);
                 continue;
             }
-            
-            // Find conversational pair
-            const pair = findPair(match);
-            const pairAlive = pair && this.conversation.isChunkAlive(pair.turn_id, pair.sentence_id, pair.role);
-            const pairCost = (pair && !pairAlive) ? pair.tokenCount : 0;
-            
+
+            // Find conversational pairs (cross-turn + same-turn S0)
+            const pairs = findPairs(match);
+
+            // Calculate cost for each pair chunk (only if dead)
+            let crossTurnCost = 0;
+            let sameTurnCost = 0;
+
+            if (pairs.crossTurnPair) {
+                const crossAlive = this.conversation.tokens.some(t =>
+                    t.turn_id === pairs.crossTurnPair.turn_id &&
+                    t.sentence_id === pairs.crossTurnPair.sentence_id &&
+                    t.role === pairs.crossTurnPair.role &&
+                    !t.deleted
+                );
+                if (!crossAlive) {
+                    crossTurnCost = pairs.crossTurnPair.tokenCount;
+                }
+            }
+
+            if (pairs.sameTurnS0) {
+                const sameAlive = this.conversation.tokens.some(t =>
+                    t.turn_id === pairs.sameTurnS0.turn_id &&
+                    t.sentence_id === pairs.sameTurnS0.sentence_id &&
+                    t.role === pairs.sameTurnS0.role &&
+                    !t.deleted
+                );
+                if (!sameAlive) {
+                    sameTurnCost = pairs.sameTurnS0.tokenCount;
+                }
+            }
+
+            // Calculate total cost: target + cross-turn pair + same-turn S0
+            const totalCost = match.tokenCount + crossTurnCost + sameTurnCost;
+
             // Skip if combined cost would exceed budget
-            if (tokensUsed + match.tokenCount + pairCost > tokenBudget) {
+            if (tokensUsed + totalCost > tokenBudget) {
                 skippedBudget.push(match);
                 continue;
             }
-            
-            // Resurrect the matched chunk
-            const count = this.conversation.resurrectByTuple(
-                match.turn_id, 
-                match.sentence_id, 
+
+            // Mark for resurrection (with all costs)
+            tokensUsed += totalCost;
+            resurrectedChunks.push({
+                match,
+                count: match.tokenCount,
+                crossTurnPair: crossTurnCost > 0 ? pairs.crossTurnPair : null,
+                sameTurnS0: sameTurnCost > 0 ? pairs.sameTurnS0 : null,
+                totalCost
+            });
+
+            // Collect turn_ids that need loading from IndexedDB
+            if (!inMemory) {
+                positionsToLoad.add(match.turn_id);
+            }
+
+            if (pairs.crossTurnPair && crossTurnCost > 0) {
+                positionsToLoad.add(pairs.crossTurnPair.turn_id);
+            }
+
+            // Same-turn S0 is already loaded if we're loading match.turn_id
+        }
+
+        // Load missing tokens from IndexedDB
+        if (positionsToLoad.size > 0) {
+            console.log(`   Loading ${positionsToLoad.size} turns from IndexedDB...`);
+            this._setStatus(`Loading ${positionsToLoad.size} conversation segments...`, '');
+
+            for (const turnId of positionsToLoad) {
+                const tokens = await this.store.getTokensByTurn(turnId);
+                for (const token of tokens) {
+                    // Add to conversation if not already present
+                    if (!this.conversation.tokens.find(t => t.position === token.position)) {
+                        this.conversation.tokens.push(token);
+                    }
+                }
+            }
+
+            // Sort by position to maintain chronological order
+            this.conversation.tokens.sort((a, b) => a.position - b.position);
+            this.conversation._invalidateCache();
+        }
+
+        // Second pass: actually resurrect the chunks (now that tokens are loaded)
+        totalResurrected = 0;
+        for (const { match, count, crossTurnPair, sameTurnS0, totalCost } of resurrectedChunks) {
+            // 1. Resurrect cross-turn pair (other role's sentence_0)
+            if (crossTurnPair) {
+                const crossCount = this.conversation.resurrectByTuple(
+                    crossTurnPair.turn_id,
+                    crossTurnPair.sentence_id,
+                    crossTurnPair.role
+                );
+
+                if (crossCount > 0) {
+                    this.semanticIndex.markReferenced(crossTurnPair.turn_id, crossTurnPair.sentence_id, crossTurnPair.role);
+                    totalResurrected += crossCount;
+                }
+            }
+
+            // 2. Resurrect same-turn sentence_0 (if target is not S0)
+            if (sameTurnS0) {
+                const sameCount = this.conversation.resurrectByTuple(
+                    sameTurnS0.turn_id,
+                    sameTurnS0.sentence_id,
+                    sameTurnS0.role
+                );
+
+                if (sameCount > 0) {
+                    this.semanticIndex.markReferenced(sameTurnS0.turn_id, sameTurnS0.sentence_id, sameTurnS0.role);
+                    totalResurrected += sameCount;
+                }
+            }
+
+            // 3. Resurrect the target chunk
+            const resCount = this.conversation.resurrectByTuple(
+                match.turn_id,
+                match.sentence_id,
                 match.role
             );
-            
-            if (count > 0) {
+
+            if (resCount > 0) {
                 this.semanticIndex.markReferenced(match.turn_id, match.sentence_id, match.role);
-                totalResurrected += count;
-                tokensUsed += count;
-                resurrectedChunks.push({ match, count });
-            }
-            
-            // Resurrect the pair if it exists and is dead
-            if (pair && !pairAlive) {
-                const pairCount = this.conversation.resurrectByTuple(
-                    pair.turn_id,
-                    pair.sentence_id,
-                    pair.role
-                );
-                
-                if (pairCount > 0) {
-                    this.semanticIndex.markReferenced(pair.turn_id, pair.sentence_id, pair.role);
-                    totalResurrected += pairCount;
-                    tokensUsed += pairCount;
-                    resurrectedChunks.push({ 
-                        match: { ...pair, text: '(paired)', similarity: 0 }, 
-                        count: pairCount 
-                    });
-                }
+                totalResurrected += resCount;
             }
         }
         
@@ -354,38 +508,45 @@ class App {
         if (skippedBudget.length > 0) {
             console.log(`   Skipped (budget full): ${skippedBudget.length} chunks`);
         }
-        
+
         if (resurrectedChunks.length > 0) {
             console.log(`   ✨ RESURRECTED ${resurrectedChunks.length} chunks (${totalResurrected} tokens):`);
             for (const { match, count } of resurrectedChunks) {
                 console.log(`      [turn ${match.turn_id}] "${match.text.substring(0, 50)}${match.text.length > 50 ? '...' : ''}" (${count} tok, sim=${match.similarity.toFixed(3)})`);
             }
-            
+
             // Rebuild UI to show resurrected tokens
+            this._setStatus('Rendering conversation...', '');
             this.renderer.rebuild(this.conversation);
             this._updateStats();
         } else {
-            console.log(`   Result: No dead chunks to resurrect`);
+            console.log(`   Result: No chunks to resurrect`);
         }
+
+        this._setStatus('Ready', 'connected');
     }
 
     async _addMessage(role, text) {
         // Get custom names (fall back to defaults)
         const userName = this.elements.userName.value.trim() || 'user';
         const aiName = this.elements.aiName.value.trim() || 'assistant';
-        
+
         // Format with ChatML using custom names
-        const formatted = role === 'system' 
+        const formatted = role === 'system'
             ? `<|im_start|>system\n${text}<|im_end|>\n`
             : role === 'user'
             ? `<|im_start|>${userName}\n${text}<|im_end|>\n`
             : text;
-        
+
         // Tokenize
         const tokens = await this.client.tokenize(formatted);
 
-        // Add to conversation
-        this.conversation.addMessage(role, tokens);
+        // Add to conversation WITH synchronous persistence (blocks until DB write completes)
+        await this.conversation.addMessage(role, tokens, { waitForPersist: true });
+
+        // Index new chunks in semantic index (blocks until indexing completes)
+        await this.semanticIndex.indexNewChunks(this.conversation);
+
         // NOTE: Don't call nextTurn() here - it's called after generation completes
         // This ensures user message and assistant response are on different turns
 
@@ -393,8 +554,9 @@ class App {
         if (this.capture.isCapturing && role !== 'assistant') {
             await this.capture.recordPromptTokens(this.conversation.tokens);
         }
-        
-        // Render
+
+        // Render ONLY after all persistence is complete
+        // At this point, UI reflects exactly what's in the database
         this.renderer.rebuild(this.conversation);
         this._updateStats();
     }
@@ -478,9 +640,14 @@ class App {
                         t1 = performance.now();
                         this.conversation.updateBrightness(attention);
                         this._timingStats.updateBrightness += performance.now() - t1;
-                        
+
                         t1 = performance.now();
-                        this.renderer.updateColors(this.conversation);
+                        // Get brightness range for dynamic visualization
+                        const stats = this.conversation.getStats();
+                        this.renderer.updateColors(this.conversation, {
+                            minBrightness: stats.minBrightness,
+                            maxBrightness: stats.maxBrightness
+                        });
                         this._timingStats.updateColors += performance.now() - t1;
                         
                         // Record if capturing (fire-and-forget to not block token stream)
@@ -515,11 +682,29 @@ class App {
                 // onDone callback
                 async (data) => {
                     console.log('Generation complete:', data);
-                    
+
+                    // CRITICAL: Persist brightness updates to database
+                    // During generation, brightness was updated in memory but not saved
+                    // Without this, reloading loses all accumulated signal
+                    if (this.store) {
+                        const activeTokens = this.conversation.getActiveTokens();
+                        console.log(`💾 Persisting brightness for ${activeTokens.length} active tokens...`);
+                        const startPersist = performance.now();
+
+                        // Batch save all active tokens (fire-and-forget for speed)
+                        for (const token of activeTokens) {
+                            this.store.saveToken(token).catch(err => {
+                                console.warn('Failed to persist token brightness:', err);
+                            });
+                        }
+
+                        console.log(`💾 Brightness persist queued in ${(performance.now() - startPersist).toFixed(1)}ms`);
+                    }
+
                     // Index new chunks after generation completes
                     // This happens while user reads response (hides latency)
                     await this.semanticIndex.indexNewChunks(this.conversation);
-                    
+
                     // Prune after generation - all tokens have had a chance to accumulate attention
                     this._checkPruning();
                     
@@ -585,14 +770,14 @@ class App {
     _checkPruning() {
         const maxContext = parseInt(this.elements.maxContext.value);
         if (maxContext <= 0) return;  // Pruning disabled
-        
+
         const beforeCount = this.conversation.getActiveTokenCount();
         const prunedSentences = this.conversation.pruneToFit(maxContext);
-        
+
         if (prunedSentences.length > 0) {
             this.totalPruned += prunedSentences.length;
             this.renderer.rebuild(this.conversation);
-            
+
             const afterCount = this.conversation.getActiveTokenCount();
             console.log(`\n🗑️ PRUNING REPORT`);
             console.log(`   Budget: ${maxContext} tokens`);
@@ -603,17 +788,41 @@ class App {
                 const text = this.conversation.reconstructText(sentence.tokens);
                 console.log(`      [turn ${sentence.turn_id}] "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}" (${sentence.tokens.length} tok, peak=${sentence.peakBrightness})`);
             }
+
+            // Update graveyard if visible
+            if (!this.elements.graveyard.classList.contains('collapsed')) {
+                this._updateGraveyard();
+            }
         }
     }
 
-    _handleClear() {
+    async _handleClear() {
         if (this.isGenerating) return;
-        
+
+        // Confirm before clearing (this is destructive in the infinite conversation model)
+        const confirmed = confirm(
+            'This will erase the ENTIRE conversation history from the database.\n\n' +
+            'This action cannot be undone. All past conversations will be lost.\n\n' +
+            'Are you sure?'
+        );
+
+        if (!confirmed) return;
+
         this.conversation.clear();
         this.semanticIndex.clear();
         this.renderer.clear();
         this.totalPruned = 0;
         this._updateStats();
+
+        // Clear IndexedDB
+        try {
+            await this.store.clearAll();
+            console.log('💾 Database cleared');
+            this._setStatus('Database cleared', 'success');
+        } catch (err) {
+            console.error('Failed to clear database:', err);
+            this._setStatus('Failed to clear database', 'error');
+        }
     }
 
     _handleExport() {
@@ -748,17 +957,297 @@ class App {
         // Coalesce multiple calls per frame
         if (this._statsPending) return;
         this._statsPending = true;
-        
+
         requestAnimationFrame(() => {
             this._statsPending = false;
             const stats = this.conversation.getStats();
             this.elements.statTokens.textContent = stats.activeTokens;
-            this.elements.statBrightness.textContent = 
-                stats.activeTokens > 0 
-                    ? `${stats.minBrightness} - ${stats.maxBrightness}` 
+            this.elements.statBrightness.textContent =
+                stats.activeTokens > 0
+                    ? `${stats.minBrightness} - ${stats.maxBrightness}`
                     : '-';
             this.elements.statPruned.textContent = this.totalPruned;
         });
+    }
+
+    async _updateGraveyard() {
+        // Load all dead tokens from database
+        const deadTokens = await this.store.getAllDeadTokens();
+
+        if (deadTokens.length === 0) {
+            this.elements.graveyardContent.innerHTML = '<p class="hint">No pruned chunks yet.</p>';
+            return;
+        }
+
+        // Group dead tokens into chunks (by turn_id, sentence_id, role)
+        const chunkMap = new Map();
+        const roleNum = { system: 0, user: 1, assistant: 2 };
+
+        for (const token of deadTokens) {
+            const key = token.turn_id * 1000000 + token.sentence_id * 10 + (roleNum[token.role] || 0);
+
+            let chunk = chunkMap.get(key);
+            if (!chunk) {
+                chunk = {
+                    turn_id: token.turn_id,
+                    sentence_id: token.sentence_id,
+                    role: token.role,
+                    tokens: [],
+                    peakBrightness: -Infinity
+                };
+                chunkMap.set(key, chunk);
+            }
+
+            chunk.tokens.push(token);
+
+            // Track peak brightness at deletion
+            if (token.brightness_at_deletion !== undefined && token.brightness_at_deletion > chunk.peakBrightness) {
+                chunk.peakBrightness = token.brightness_at_deletion;
+            }
+        }
+
+        // Convert to array and sort by turn, then sentence
+        const deadChunks = Array.from(chunkMap.values()).sort((a, b) => {
+            if (a.turn_id !== b.turn_id) return a.turn_id - b.turn_id;
+            return a.sentence_id - b.sentence_id;
+        });
+
+        // Clear existing content
+        this.elements.graveyardContent.innerHTML = '';
+
+        // Render each dead chunk
+        for (const chunk of deadChunks) {
+            const chunkEl = document.createElement('div');
+            chunkEl.className = 'graveyard-chunk';
+            chunkEl.dataset.turnId = chunk.turn_id;
+            chunkEl.dataset.sentenceId = chunk.sentence_id;
+            chunkEl.dataset.role = chunk.role;
+
+            const headerEl = document.createElement('div');
+            headerEl.className = 'graveyard-chunk-header';
+            headerEl.textContent = `Turn ${chunk.turn_id} • ${chunk.role} • S${chunk.sentence_id}`;
+
+            const textEl = document.createElement('div');
+            textEl.className = 'graveyard-chunk-text';
+            const text = this.conversation.reconstructText(chunk.tokens);
+            textEl.textContent = text.substring(0, 200) + (text.length > 200 ? '...' : '');
+
+            const statsEl = document.createElement('div');
+            statsEl.className = 'graveyard-chunk-stats';
+            statsEl.innerHTML = `
+                <span>${chunk.tokens.length} tokens</span>
+                <span>Peak: ${chunk.peakBrightness}</span>
+            `;
+
+            chunkEl.appendChild(headerEl);
+            chunkEl.appendChild(textEl);
+            chunkEl.appendChild(statsEl);
+
+            // Click to resurrect
+            chunkEl.addEventListener('click', () => this._handleResurrect(chunk.turn_id, chunk.sentence_id, chunk.role));
+
+            this.elements.graveyardContent.appendChild(chunkEl);
+        }
+    }
+
+    _toggleGraveyard() {
+        const isCollapsed = this.elements.graveyard.classList.toggle('collapsed');
+
+        // Update graveyard content when opening
+        if (!isCollapsed) {
+            this._updateGraveyard();
+        }
+    }
+
+    /**
+     * Resurrect a chunk with its turn pairs (same logic as semantic resurrection)
+     * @param {number} turn_id - Target chunk turn ID
+     * @param {number} sentence_id - Target chunk sentence ID
+     * @param {string} role - Target chunk role
+     * @returns {Promise<Object>} - Info about resurrected chunks
+     */
+    async _resurrectChunkWithPairs(turn_id, sentence_id, role) {
+        // Find conversational pairs for this chunk
+        const findPairs = (targetTurn, targetSentence, targetRole) => {
+            const pairs = { crossTurnPair: null, sameTurnS0: null };
+
+            // System chunks don't pair
+            if (targetRole === 'system') return pairs;
+
+            // 1. Cross-turn pair (sentence_0 from other role's turn)
+            let pairTurn, pairRole;
+            if (targetRole === 'user') {
+                pairTurn = targetTurn + 1;
+                pairRole = 'assistant';
+            } else if (targetRole === 'assistant') {
+                pairTurn = targetTurn - 1;
+                pairRole = 'user';
+            }
+
+            const crossEntry = this.semanticIndex.entries.find(e =>
+                e.turn_id === pairTurn && e.sentence_id === 0 && e.role === pairRole
+            );
+
+            if (crossEntry) {
+                pairs.crossTurnPair = {
+                    turn_id: pairTurn,
+                    sentence_id: 0,
+                    role: pairRole
+                };
+            }
+
+            // 2. Same-turn sentence_0 (only if target is NOT sentence_0)
+            if (targetSentence !== 0) {
+                const sameTurnEntry = this.semanticIndex.entries.find(e =>
+                    e.turn_id === targetTurn && e.sentence_id === 0 && e.role === targetRole
+                );
+
+                if (sameTurnEntry) {
+                    pairs.sameTurnS0 = {
+                        turn_id: targetTurn,
+                        sentence_id: 0,
+                        role: targetRole
+                    };
+                }
+            }
+
+            return pairs;
+        };
+
+        const pairs = findPairs(turn_id, sentence_id, role);
+        const turnsToLoad = new Set();
+
+        // Check if target chunk is in memory
+        const targetInMemory = this.conversation.tokens.some(t =>
+            t.turn_id === turn_id && t.sentence_id === sentence_id && t.role === role
+        );
+
+        if (!targetInMemory) {
+            turnsToLoad.add(turn_id);
+        }
+
+        // Check if cross-turn pair needs loading
+        if (pairs.crossTurnPair) {
+            const crossInMemory = this.conversation.tokens.some(t =>
+                t.turn_id === pairs.crossTurnPair.turn_id
+            );
+            if (!crossInMemory) {
+                turnsToLoad.add(pairs.crossTurnPair.turn_id);
+            }
+        }
+
+        // Load missing turns from IndexedDB
+        if (turnsToLoad.size > 0) {
+            for (const turnId of turnsToLoad) {
+                const tokens = await this.store.getTokensByTurn(turnId);
+                for (const token of tokens) {
+                    if (!this.conversation.tokens.find(t => t.position === token.position)) {
+                        this.conversation.tokens.push(token);
+                    }
+                }
+            }
+
+            // Sort by position
+            this.conversation.tokens.sort((a, b) => a.position - b.position);
+            this.conversation._invalidateCache();
+        }
+
+        // Resurrect chunks in order: cross-turn pair → same-turn S0 → target
+        const resurrected = [];
+
+        if (pairs.crossTurnPair) {
+            const count = this.conversation.resurrectByTuple(
+                pairs.crossTurnPair.turn_id,
+                pairs.crossTurnPair.sentence_id,
+                pairs.crossTurnPair.role
+            );
+            if (count > 0) {
+                resurrected.push({ ...pairs.crossTurnPair, count });
+                this.semanticIndex.markReferenced(
+                    pairs.crossTurnPair.turn_id,
+                    pairs.crossTurnPair.sentence_id,
+                    pairs.crossTurnPair.role
+                );
+            }
+        }
+
+        if (pairs.sameTurnS0) {
+            const count = this.conversation.resurrectByTuple(
+                pairs.sameTurnS0.turn_id,
+                pairs.sameTurnS0.sentence_id,
+                pairs.sameTurnS0.role
+            );
+            if (count > 0) {
+                resurrected.push({ ...pairs.sameTurnS0, count });
+                this.semanticIndex.markReferenced(
+                    pairs.sameTurnS0.turn_id,
+                    pairs.sameTurnS0.sentence_id,
+                    pairs.sameTurnS0.role
+                );
+            }
+        }
+
+        // Resurrect target chunk
+        const targetCount = this.conversation.resurrectByTuple(turn_id, sentence_id, role);
+        if (targetCount > 0) {
+            resurrected.push({ turn_id, sentence_id, role, count: targetCount });
+            this.semanticIndex.markReferenced(turn_id, sentence_id, role);
+        }
+
+        return {
+            target: { turn_id, sentence_id, role },
+            resurrected,
+            totalTokens: resurrected.reduce((sum, r) => sum + r.count, 0)
+        };
+    }
+
+    /**
+     * Handle manual resurrection from graveyard (with auto-pin)
+     */
+    async _handleResurrect(turn_id, sentence_id, role) {
+        try {
+            // Use same resurrection logic as semantic search (with turn pairs)
+            const result = await this._resurrectChunkWithPairs(turn_id, sentence_id, role);
+
+            // Pin ONLY the target chunk (the one user explicitly selected)
+            // Set brightness to 10k (strongest user signal - manual resurrection)
+            const targetTokens = this.conversation.tokens.filter(t =>
+                t.turn_id === turn_id &&
+                t.sentence_id === sentence_id &&
+                t.role === role &&
+                !t.deleted
+            );
+
+            for (const token of targetTokens) {
+                token.pinned = true;
+                token.brightness = 10000;  // Manual resurrection: user declared importance
+                await this.store.saveToken(token);  // Persist pinned state and brightness
+            }
+
+            // Invalidate cache
+            this.conversation._invalidateCache();
+
+            // Rebuild UI (will show pin indicator and resurrected chunks)
+            this.renderer.rebuild(this.conversation);
+
+            // Update graveyard and stats
+            await this._updateGraveyard();
+            this._updateStats();
+
+            const pairInfo = result.resurrected
+                .filter(r => r.turn_id !== turn_id || r.sentence_id !== sentence_id || r.role !== role)
+                .map(r => `${r.role} T${r.turn_id}S${r.sentence_id}`)
+                .join(', ');
+
+            console.log(`✨ Manual resurrection: turn ${turn_id}, sentence ${sentence_id}, ${role} (${result.totalTokens} tokens)`);
+            if (pairInfo) {
+                console.log(`   → Also resurrected turn pairs: ${pairInfo}`);
+            }
+            console.log(`   → Target chunk pinned (user signal)`);
+        } catch (err) {
+            console.error('Resurrection failed:', err);
+            this._setStatus('Resurrection failed: ' + err.message, 'error');
+        }
     }
 
     _setStatus(text, className) {
@@ -800,6 +1289,113 @@ class App {
         } catch (err) {
             console.warn('Failed to load settings:', err);
         }
+    }
+
+    // ========== Chunk Deletion ==========
+
+    /**
+     * Handle chunk deletion (user clicks X button)
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence ID
+     * @param {string} role - Role
+     */
+    async _handleDeleteChunk(turn_id, sentence_id, role) {
+        console.log(`🗑️ Delete requested: turn ${turn_id}, sentence ${sentence_id}, ${role}`);
+
+        // Rule 1: If deleting user turn sentence_0, delete user turn + assistant response
+        if (role === 'user' && sentence_id === 0) {
+            await this._deleteTurnPair(turn_id, turn_id + 1);
+            return;
+        }
+
+        // Rule 2: If deleting assistant turn, delete assistant turn + user question
+        // If it's the most recent assistant turn, restore user text to input
+        if (role === 'assistant') {
+            const userTurn = turn_id - 1;
+            const mostRecentAssistantTurn = this.conversation.currentTurnId - 1;
+            const isRecent = (turn_id === mostRecentAssistantTurn);
+
+            await this._deleteTurnPair(userTurn, turn_id, isRecent);
+            return;
+        }
+
+        // Rule 3: Otherwise, just delete the single chunk
+        await this._deleteSingleChunk(turn_id, sentence_id, role);
+    }
+
+    /**
+     * Delete a single chunk
+     * @param {number} turn_id - Turn ID
+     * @param {number} sentence_id - Sentence ID
+     * @param {string} role - Role
+     */
+    async _deleteSingleChunk(turn_id, sentence_id, role) {
+        // 1. Prune tokens (set deleted=true)
+        const sentences = this.conversation.getSentences();
+        const sentence = sentences.find(s =>
+            s.turn_id === turn_id &&
+            s.sentence_id === sentence_id &&
+            s.role === role
+        );
+
+        if (!sentence) {
+            console.warn(`Chunk not found: turn ${turn_id}, sentence ${sentence_id}, ${role}`);
+            return;
+        }
+
+        this.conversation._deleteSentence(sentence);
+
+        // 2. Delete embedding from semantic index
+        await this.semanticIndex.deleteChunkFromSearch(turn_id, sentence_id, role);
+
+        // 3. Rebuild UI
+        this.renderer.rebuild(this.conversation);
+        this._updateStats();
+
+        console.log(`✅ Deleted chunk: turn ${turn_id}, sentence ${sentence_id}, ${role}`);
+    }
+
+    /**
+     * Delete turn pair (user question + assistant response)
+     * @param {number} userTurn - User turn ID
+     * @param {number} assistantTurn - Assistant turn ID
+     * @param {boolean} restoreText - If true, restore user text to input box
+     */
+    async _deleteTurnPair(userTurn, assistantTurn, restoreText = false) {
+        console.log(`🗑️ Deleting turn pair: ${userTurn} (user) + ${assistantTurn} (assistant)`);
+
+        // Optionally restore user text to input (if deleting recent assistant turn)
+        if (restoreText) {
+            const userText = this.conversation.reconstructTurnText(userTurn);
+            if (userText) {
+                this.elements.userInput.value = userText;
+                console.log(`📝 Restored user text to input: "${userText.substring(0, 50)}..."`);
+            }
+        }
+
+        // Get all sentences from both turns
+        const sentences = this.conversation.getSentences();
+        const userSentences = sentences.filter(s => s.turn_id === userTurn);
+        const assistantSentences = sentences.filter(s => s.turn_id === assistantTurn);
+
+        // Delete all chunks (set deleted=true, remove embeddings)
+        for (const sentence of [...userSentences, ...assistantSentences]) {
+            // Prune tokens
+            this.conversation._deleteSentence(sentence);
+
+            // Delete embedding
+            await this.semanticIndex.deleteChunkFromSearch(
+                sentence.turn_id,
+                sentence.sentence_id,
+                sentence.role
+            );
+        }
+
+        // Rebuild UI
+        this.renderer.rebuild(this.conversation);
+        this._updateStats();
+
+        console.log(`✅ Deleted turn pair: ${userSentences.length + assistantSentences.length} chunks removed`);
     }
 }
 
