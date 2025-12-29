@@ -332,15 +332,17 @@ export class Renderer {
         const sentenceEl = this._ensureSentenceElement(sentence.turn_id, sentence.sentence_id, sentence.role);
         if (!sentenceEl) return;
 
-        if (sentence.deleted) {
+        if (sentence.fullyDeleted) {
             sentenceEl.classList.add('deleted');
         }
 
         // Set pinned state
         sentenceEl.classList.toggle('pinned', sentence.pinned);
 
-        // Use peakBrightness already computed by getSentences()
-        const peakBrightness = sentence.peakBrightness !== -Infinity ? sentence.peakBrightness : 10000;
+        // Use peakBrightness for active sentences, 0 for deleted (darkest)
+        const peakBrightness = sentence.fullyDeleted
+            ? 0
+            : (sentence.peakBrightness !== -Infinity ? sentence.peakBrightness : 10000);
 
         // Get brightness range for scaling
         const minB = options.minBrightness !== undefined ? options.minBrightness : 0;
