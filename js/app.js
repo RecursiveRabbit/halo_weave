@@ -532,11 +532,14 @@ class App {
         const aiName = this.elements.aiName.value.trim() || 'assistant';
 
         // Format with ChatML using custom names
+        // Prepend timestamp BEFORE the im_start tag so it's metadata, not message content
+        const timestamp = new Date().toISOString().replace('T', '_').split('.')[0];
+
         const formatted = role === 'system'
             ? `<|im_start|>system\n${text}<|im_end|>\n`
             : role === 'user'
-            ? `<|im_start|>${userName}\n${text}<|im_end|>\n`
-            : text;
+            ? `(${timestamp}) <|im_start|>${userName}\n${text}<|im_end|>\n`
+            : `(${timestamp}) ${text}`;  // Assistant (no im_start, that's added separately)
 
         // Tokenize
         const tokens = await this.client.tokenize(formatted);
@@ -564,13 +567,14 @@ class App {
     async _generate() {
         // Get custom AI name
         const aiName = this.elements.aiName.value.trim() || 'assistant';
-        
+
         // Start AI turn
         this.conversation.currentRole = 'assistant';  // Internal role stays 'assistant'
         this.conversation.currentSentenceId = 0;
-        
-        // Add AI prefix with custom name
-        const prefix = `<|im_start|>${aiName}\n`;
+
+        // Add AI prefix with timestamp BEFORE im_start tag (metadata, not content)
+        const timestamp = new Date().toISOString().replace('T', '_').split('.')[0];
+        const prefix = `(${timestamp}) <|im_start|>${aiName}\n`;
         const prefixTokens = await this.client.tokenize(prefix);
         for (const t of prefixTokens) {
             const token = this.conversation.addStreamingToken(t.token_id, t.text);
@@ -751,18 +755,18 @@ class App {
         });
         
         console.log('🔓 Generation Promise resolved');
-        
-        // TODO: End token tokenization is hanging - skip for now
-        // try {
-        //     const endTokens = await this.client.tokenize('<|im_end|>\n');
-        //     for (const t of endTokens) {
-        //         const token = this.conversation.addStreamingToken(t.token_id, t.text);
-        //         this.renderer.addToken(token, this.conversation);
-        //     }
-        // } catch (err) {
-        //     console.warn('Failed to add end token:', err);
-        // }
-        
+
+        // Add end token to close assistant turn
+        try {
+            const endTokens = await this.client.tokenize('<|im_end|>\n');
+            for (const t of endTokens) {
+                const token = this.conversation.addStreamingToken(t.token_id, t.text);
+                this.renderer.addToken(token, this.conversation);
+            }
+        } catch (err) {
+            console.warn('Failed to add end token:', err);
+        }
+
         this._updateStats();
         console.log('🔓 _generate() complete');
     }

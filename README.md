@@ -24,7 +24,7 @@ Requires modified KoboldCPP with attention extraction and SSE streaming.
 
 ```bash
 cd halo_weave
-python -m http.server 8080
+python3 -m http.server 8080
 # Open http://localhost:8080
 ```
 

@@ -286,12 +286,19 @@ export class SemanticIndex {
             const contextText = this._buildContextWindow(sentence, sentences, conversation);
             
             // Create entry
+            // Use peakBrightnessAtDeletion if available (pruned chunk),
+            // otherwise use current peakBrightness (active chunk, default to 10k if never seen attention)
+            const brightness = sentence.peakBrightnessAtDeletion !== null
+                ? sentence.peakBrightnessAtDeletion
+                : (sentence.peakBrightness === -Infinity ? 10000 : sentence.peakBrightness);
+
             const entry = {
                 turn_id: sentence.turn_id,
                 sentence_id: sentence.sentence_id,
                 role: sentence.role,
                 text: text,
                 tokenCount: sentence.tokens.length,
+                brightness_at_deletion: brightness,  // Preserve brightness for resurrection
                 embedding: null,
                 referenceCount: 0
             };

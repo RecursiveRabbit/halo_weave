@@ -63,18 +63,6 @@ app.js (Main Controller)
 
 ### UI Layout
 
-```
-┌────────────┬─────────────────────┬──────────────┐
-│  Settings  │   Active Context    │  Graveyard   │
-│  (Left)    │   (Main Panel)      │  (Right)     │
-│            │                     │              │
-│ • System   │ Tokens with         │ Dead chunks  │
-│ • Gen      │ brightness          │ Click to     │
-│ • Pruning  │ visualization       │ resurrect    │
-│ • Data     │                     │ (auto-pins)  │
-└────────────┴─────────────────────┴──────────────┘
-```
-
 **Main panel:** Shows only active context (what the model sees)
 **Graveyard sidebar:** Shows pruned chunks from `deadTokens` store (collapsible)
 

@@ -1,4 +1,4 @@
-Document the important facts in the following article: 
+Extract the key facts from the following article:
 
 The Patent Office Is About To Make Bad Patents Untouchable
 The U.S. Patent and Trademark Office (USPTO) has proposed new rules that would effectively end the public’s ability to challenge improperly granted patents at the Patent Office itself. We need EFF
