@@ -49,10 +49,10 @@ export class Conversation {
         this._activeTokenCount = 0;
 
         // === VISUALIZATION: Dynamic pruning threshold ===
-        // Track the brightness of the most recently pruned chunk
-        // This serves as the "floor" for visualization - anything approaching
-        // this value is close to being pruned
-        this.lastPrunedBrightness = null;
+        // Rolling average of pruned chunk brightness levels
+        // Updated when chunks are selected for pruning (not just when actually pruned)
+        // Formula: brightnessFloor = (brightnessFloor + selectedPeakBrightness) / 2
+        this.brightnessFloor = null;
 
         // === Mean brightness tracking ===
         // Updated during brightness scoring, used for resurrection
@@ -621,8 +621,13 @@ export class Conversation {
             if (prunableSentenceCount <= 1) break;
 
             if (lowestSentence) {
-                // Track this as the most recently pruned brightness (for visualization floor)
-                this.lastPrunedBrightness = lowestSentence.peakBrightness;
+                // Update brightness floor with rolling average
+                // This smooths out variations and tracks the overall pruning trend
+                if (this.brightnessFloor === null) {
+                    this.brightnessFloor = lowestSentence.peakBrightness;
+                } else {
+                    this.brightnessFloor = (this.brightnessFloor + lowestSentence.peakBrightness) / 2;
+                }
 
                 // Check if this is an anchor that needs to be pruned with its pair
                 if (lowestSentence.sentence_id === 0 && (lowestSentence.role === 'user' || lowestSentence.role === 'assistant')) {
@@ -1042,7 +1047,7 @@ export class Conversation {
             minBrightness: min,
             maxBrightness: max,
             avgBrightness: Math.round(sum / len),
-            lastPrunedBrightness: this.lastPrunedBrightness  // Dynamic visualization floor
+            brightnessFloor: this.brightnessFloor  // Rolling average visualization floor
         };
     }
 

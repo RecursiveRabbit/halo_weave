@@ -39,10 +39,10 @@ export class Renderer {
         // Get brightness range for dynamic scaling
         const stats = conversation.getStats();
 
-        // Use lastPrunedBrightness as floor if available (shows "the line")
+        // Use brightnessFloor (rolling average of pruned chunks) if available
         // Otherwise fall back to actual minimum
-        const minB = stats.lastPrunedBrightness !== null
-            ? stats.lastPrunedBrightness
+        const minB = stats.brightnessFloor !== null
+            ? stats.brightnessFloor
             : stats.minBrightness;
         const maxB = stats.maxBrightness;
 
@@ -91,10 +91,10 @@ export class Renderer {
         if (minB === undefined || maxB === undefined) {
             const stats = conversation.getStats();
 
-            // Use lastPrunedBrightness as floor if available (shows "the line")
+            // Use brightnessFloor (rolling average of pruned chunks) if available
             // Otherwise fall back to actual minimum
-            minB = stats.lastPrunedBrightness !== null
-                ? stats.lastPrunedBrightness
+            minB = stats.brightnessFloor !== null
+                ? stats.brightnessFloor
                 : stats.minBrightness;
             maxB = stats.maxBrightness;
         }
