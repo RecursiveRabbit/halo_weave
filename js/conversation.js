@@ -6,8 +6,8 @@
  * Algorithm (per generation step):
  * 1. Aggregate attention across layers/heads
  * 2. Calculate threshold excluding BOS: (1.0 - bos_attention) / (context_len - 1)
- * 3. Calculate mean brightness across all active tokens (excluding current turn)
- * 4. For each non-BOS token:
+ * 3. Calculate mean brightness across all active tokens
+ * 4. For each non-BOS token (including current turn):
  *    - If attention > threshold: score += int(attention / threshold), cap at 10000
  *    - If attention <= threshold: score -= 1
  * 5. New tokens start at 10000 (fail-bright)
@@ -426,13 +426,13 @@ export class Conversation {
         // Skip if threshold is invalid
         if (threshold <= 0 || !isFinite(threshold)) return;
 
-        // Calculate mean brightness (excluding current turn)
+        // Calculate mean brightness across all active tokens
         let brightnessSum = 0;
         let brightnessCount = 0;
 
         for (let i = 0; i < this.tokens.length; i++) {
             const token = this.tokens[i];
-            if (!token.deleted && token.turn_id !== this.currentTurnId) {
+            if (!token.deleted) {
                 brightnessSum += token.brightness;
                 brightnessCount++;
             }
@@ -442,15 +442,9 @@ export class Conversation {
         this.meanBrightness = brightnessCount > 0 ? Math.floor(brightnessSum / brightnessCount) : 5000;
 
         // Update scores for non-BOS tokens (activeTokens[i] is already the token)
-        // Skip current turn tokens - they're in their local attention wave
         const len = Math.min(aggregated.length, contextLen);
         for (let i = 1; i < len; i++) {
             const token = activeTokens[i];
-
-            // Skip current turn - these tokens get massive local attention
-            // They'll start competing fairly on the next turn
-            if (token.turn_id === this.currentTurnId) continue;
-
             const att = aggregated[i];
 
             if (att > threshold) {
