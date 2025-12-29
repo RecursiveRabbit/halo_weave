@@ -61,12 +61,16 @@
   text: string,
   embedding: Float32Array,   // null if deleted
 
-  // Token data (with absolute positions)
+  // Token data (with absolute positions and brightness)
   tokens: [{
     token_id: number,
     text: string,
-    position: BigInt         // Absolute, global, unique, no overflow
+    position: BigInt,        // Absolute, global, unique, no overflow
+    brightnessAtDeletion: number  // Preserved brightness (10k if never pruned)
   }],
+
+  // Chunk-level brightness (peak of all token brightnesses)
+  brightnessAtDeletion: number,  // Peak brightness when stored/pruned
 
   // Position range (for fast lookup)
   minPosition: BigInt,       // First position in this chunk
@@ -107,10 +111,12 @@ semantic_chunks:
 
 1. **BigInt for position/turn IDs** - No overflow, ever. No death date for the conversation.
 2. **Full token data in chunks** - Enables state restoration from positions alone
-3. **Position range index (minPosition/maxPosition)** - O(k) restoration where k = active tokens, not O(n) where n = total chunks
-4. **Soft-delete via embedding=null** - Chunk stays in permanent record but never resurrects
-5. **No utility tracking** - Windows don't report back what chunks were useful (no deaths, survival turns, etc.)
-6. **All chunks timestamped** - Provides temporal context when resurrecting disparate conversations. AI can see "this was 6 months before that." Critical for making sense of semantically-related but temporally-distant chunks.
+3. **Per-token brightness storage** - Preserves attention texture across resurrection cycles. Defaults to 10k on creation, captures actual brightness on pruning.
+4. **Chunk-level pruning only** - Pruning operates on whole chunks (semantic atoms). Peak brightness = max(token brightnesses) determines chunk survival.
+5. **Position range index (minPosition/maxPosition)** - O(k) restoration where k = active tokens, not O(n) where n = total chunks
+6. **Soft-delete via embedding=null** - Chunk stays in permanent record but never resurrects
+7. **No utility tracking** - Windows don't report back what chunks were useful (no deaths, survival turns, etc.)
+8. **All chunks timestamped** - Provides temporal context when resurrecting disparate conversations. AI can see "this was 6 months before that." Critical for making sense of semantically-related but temporally-distant chunks.
 
 **Implementation note - BigInt boundaries:**
 
@@ -446,36 +452,56 @@ class Window {
 }
 ```
 
-#### Brightness on Resurrection
+#### Brightness Lifecycle
 
-**Problem:** Starting resurrected chunks at 255 when max is 10k is essentially starting at 0.
-
-**Solution: Hybrid approach**
+**On chunk creation (first indexing):**
 ```javascript
-// On pruning, preserve earned brightness
-onPrune(chunk) {
-  chunk.tokens.forEach(t => {
-    t.brightness_at_deletion = this.brightness.get(t.position);
-  });
+for (const token of chunk.tokens) {
+  token.brightnessAtDeletion = 10000;  // Innocent until proven guilty
 }
+chunk.brightnessAtDeletion = 10000;    // Chunk-level peak
+```
 
-// On resurrection, use max of (floor, mean, earned)
-onResurrect(chunk) {
-  const meanBrightness = this.calculateMeanBrightness();
-
-  chunk.tokens.forEach(t => {
-    const resurrectionBrightness = Math.max(
-      255,                              // Floor
-      meanBrightness,                   // Context baseline
-      t.brightness_at_deletion || 0     // Earned reputation
-    );
-
-    this.brightness.set(t.position, resurrectionBrightness);
-  });
+**During conversation (attention updates):**
+```javascript
+// Tokens accumulate/lose brightness based on attention
+// Windows track brightness in-memory only
+for (const token of workingTokens) {
+  this.brightness.set(token.position, updatedBrightness);
 }
 ```
 
-This respects earned reputation, adapts to context baseline, and has a safety floor.
+**On pruning (preserve earned value):**
+```javascript
+// Calculate peak brightness for chunk
+chunk.brightnessAtDeletion = Math.max(...chunk.tokens.map(t =>
+  this.brightness.get(t.position)
+));
+
+// Preserve individual token brightnesses
+for (const token of chunk.tokens) {
+  token.brightnessAtDeletion = this.brightness.get(token.position);
+}
+
+// Write to database with preserved brightnesses
+await semanticIndex.writeChunk(chunk);
+```
+
+**On resurrection (restore earned value):**
+```javascript
+// Load chunk from database
+const chunk = await semanticIndex.getChunk(turn_id, sentence_id, role);
+
+// Restore individual token brightnesses
+for (const token of chunk.tokens) {
+  this.brightness.set(token.position, token.brightnessAtDeletion);
+}
+
+// Tokens now compete based on their earned brightness
+// Must re-prove relevance via attention or will decay
+```
+
+**Key insight:** Chunks that were never pruned have `brightnessAtDeletion = 10000` (they earned it by surviving). Chunks that were pruned preserve their earned brightness at time of deletion. No hybrid calculation needed - just restore what was earned.
 
 #### Window Lifecycle
 
