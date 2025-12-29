@@ -33,12 +33,17 @@ export class Renderer {
         this.tokenElements.clear();
         this.lastBrightness.clear();
         this.lastParagraphPeak.clear();
-        
+
         const sentences = conversation.getSentences();
-        
+
+        // Get brightness range for dynamic scaling
+        const stats = conversation.getStats();
+        const minB = stats.minBrightness;
+        const maxB = stats.maxBrightness;
+
         for (const sentence of sentences) {
             this._ensureTurnElement(sentence.turn_id, sentence.role);
-            this._renderSentence(sentence, conversation);
+            this._renderSentence(sentence, conversation, { minBrightness: minB, maxBrightness: maxB });
         }
     }
 
@@ -303,25 +308,35 @@ export class Renderer {
 
     /**
      * Render a paragraph - all tokens same yellow shade, bright tokens highlighted
+     * @param {Object} sentence - Sentence object from getSentences()
+     * @param {Conversation} conversation - Conversation instance
+     * @param {Object} options - Brightness range for dynamic scaling
+     * @param {number} options.minBrightness - Minimum brightness in displayed context
+     * @param {number} options.maxBrightness - Maximum brightness in displayed context
      */
-    _renderSentence(sentence, conversation) {
+    _renderSentence(sentence, conversation, options = {}) {
         const turnEl = this.turnElements.get(sentence.turn_id);
         if (!turnEl) return;
-        
+
         // Create sentence container
         const sentenceEl = this._ensureSentenceElement(sentence.turn_id, sentence.sentence_id, sentence.role);
         if (!sentenceEl) return;
-        
+
         if (sentence.deleted) {
             sentenceEl.classList.add('deleted');
         }
-        
+
         // Set pinned state
         sentenceEl.classList.toggle('pinned', sentence.pinned);
-        
+
         // Use peakBrightness already computed by getSentences()
-        const peakBrightness = sentence.peakBrightness !== -Infinity ? sentence.peakBrightness : 255;
-        const paragraphColor = this._brightnessToYellow(peakBrightness);
+        const peakBrightness = sentence.peakBrightness !== -Infinity ? sentence.peakBrightness : 10000;
+
+        // Get brightness range for scaling
+        const minB = options.minBrightness !== undefined ? options.minBrightness : 0;
+        const maxB = options.maxBrightness !== undefined ? options.maxBrightness : 10000;
+
+        const paragraphColor = this._brightnessToYellow(peakBrightness, minB, maxB);
         
         // Render tokens
         for (const token of sentence.tokens) {
