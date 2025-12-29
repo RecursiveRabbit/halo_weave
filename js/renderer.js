@@ -38,7 +38,12 @@ export class Renderer {
 
         // Get brightness range for dynamic scaling
         const stats = conversation.getStats();
-        const minB = stats.minBrightness;
+
+        // Use lastPrunedBrightness as floor if available (shows "the line")
+        // Otherwise fall back to actual minimum
+        const minB = stats.lastPrunedBrightness !== null
+            ? stats.lastPrunedBrightness
+            : stats.minBrightness;
         const maxB = stats.maxBrightness;
 
         for (const sentence of sentences) {
@@ -85,7 +90,12 @@ export class Renderer {
 
         if (minB === undefined || maxB === undefined) {
             const stats = conversation.getStats();
-            minB = stats.minBrightness;
+
+            // Use lastPrunedBrightness as floor if available (shows "the line")
+            // Otherwise fall back to actual minimum
+            minB = stats.lastPrunedBrightness !== null
+                ? stats.lastPrunedBrightness
+                : stats.minBrightness;
             maxB = stats.maxBrightness;
         }
 

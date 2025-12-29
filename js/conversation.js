@@ -48,6 +48,12 @@ export class Conversation {
         this._activeTokensCache = null;
         this._activeTokenCount = 0;
 
+        // === VISUALIZATION: Dynamic pruning threshold ===
+        // Track the brightness of the most recently pruned chunk
+        // This serves as the "floor" for visualization - anything approaching
+        // this value is close to being pruned
+        this.lastPrunedBrightness = null;
+
         // === Mean brightness tracking ===
         // Updated during brightness scoring, used for resurrection
         this.meanBrightness = 5000;  // Default for theoretical empty-context case
@@ -615,6 +621,9 @@ export class Conversation {
             if (prunableSentenceCount <= 1) break;
 
             if (lowestSentence) {
+                // Track this as the most recently pruned brightness (for visualization floor)
+                this.lastPrunedBrightness = lowestSentence.peakBrightness;
+
                 // Check if this is an anchor that needs to be pruned with its pair
                 if (lowestSentence.sentence_id === 0 && (lowestSentence.role === 'user' || lowestSentence.role === 'assistant')) {
                     // Find paired anchor and prune both together
@@ -1032,7 +1041,8 @@ export class Conversation {
             turns: this.currentTurnId,
             minBrightness: min,
             maxBrightness: max,
-            avgBrightness: Math.round(sum / len)
+            avgBrightness: Math.round(sum / len),
+            lastPrunedBrightness: this.lastPrunedBrightness  // Dynamic visualization floor
         };
     }
 
