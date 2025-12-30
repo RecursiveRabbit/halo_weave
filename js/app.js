@@ -832,7 +832,7 @@ class App {
     _handleExport() {
         const state = {
             conversation: this.conversation.exportState(),
-            semanticIndex: this.semanticIndex.exportState()
+            semanticIndex: this.semanticIndex.exportState()  // Exclude embeddings to keep file size manageable
         };
         const json = JSON.stringify(state, null, 2);
         
@@ -865,12 +865,13 @@ class App {
                     throw new Error('Invalid export file: missing tokens array');
                 }
                 
-                // Import conversation state
+                // Import conversation state first
                 this.conversation.importState(conversationState);
-                
+
                 // Import semantic index state if present
                 if (semanticIndexState) {
-                    await this.semanticIndex.importState(semanticIndexState);
+                    // Pass conversation for proper turn-pair context when regenerating embeddings
+                    await this.semanticIndex.importState(semanticIndexState, this.conversation);
                 } else if (graveyardState) {
                     // Legacy: migrate graveyard entries to semantic index
                     console.log('📚 Migrating legacy graveyard to semantic index...');

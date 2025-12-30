@@ -746,37 +746,76 @@ export class SemanticIndex {
 
     /**
      * Import state from saved data
+     * @param {Object} state - The exported semantic index state
+     * @param {Conversation} conversation - Optional conversation for context-aware embedding regeneration
      */
-    async importState(state, regenerateEmbeddings = true) {
+    async importState(state, conversation = null) {
         if (!state || !state.entries) return;
-        
+
         this.entries = state.entries.map(e => ({
             ...e,
             embedding: e.embedding ? new Float32Array(e.embedding) : null
         }));
-        
+
         // Rebuild indexed chunks set
         this._indexedChunks.clear();
         for (const e of this.entries) {
             this._indexedChunks.add(this._chunkKey(e.turn_id, e.sentence_id, e.role));
         }
-        
+
         if (state.stats) {
             this.totalIndexed = state.stats.totalIndexed || 0;
             this.totalResurrected = state.stats.totalResurrected || 0;
         }
-        
-        // Regenerate missing embeddings if requested
-        if (regenerateEmbeddings) {
-            const missing = this.entries.filter(e => !e.embedding);
-            if (missing.length > 0) {
-                console.log(`📚 Regenerating ${missing.length} embeddings...`);
+
+        // Regenerate missing embeddings
+        const missing = this.entries.filter(e => !e.embedding);
+        if (missing.length > 0) {
+            console.log(`📚 Regenerating ${missing.length} embeddings...`);
+
+            // If we have conversation context, use proper turn-pair embeddings
+            if (conversation) {
+                const sentences = conversation.getSentences();
                 for (const entry of missing) {
-                    await this._computeEmbedding(entry, entry.text);
+                    // Find the corresponding sentence in the conversation
+                    const sentence = sentences.find(s =>
+                        s.turn_id === entry.turn_id &&
+                        s.sentence_id === entry.sentence_id &&
+                        s.role === entry.role
+                    );
+
+                    if (sentence) {
+                        // Build proper context window with turn pairs
+                        const contextText = this._buildContextWindow(sentence, sentences, conversation);
+                        this._queueEmbedding(entry, contextText);
+                    } else {
+                        // Fallback to simple embedding if chunk not found in conversation
+                        try {
+                            entry.embedding = await this.embed(entry.text);
+                            if (this.store) {
+                                await this._persistEntry(entry);
+                            }
+                        } catch (err) {
+                            console.warn(`📚 Failed to regenerate embedding for chunk T${entry.turn_id}S${entry.sentence_id}:`, err);
+                        }
+                    }
+                }
+            } else {
+                // No conversation context, use simple text embedding
+                console.log('📚 No conversation context available, using simple embeddings');
+                for (const entry of missing) {
+                    try {
+                        entry.embedding = await this.embed(entry.text);
+                        if (this.store) {
+                            await this._persistEntry(entry);
+                        }
+                    } catch (err) {
+                        console.warn(`📚 Failed to regenerate embedding for chunk T${entry.turn_id}S${entry.sentence_id}:`, err);
+                    }
                 }
             }
         }
-        
+
         console.log(`📚 Imported ${this.entries.length} index entries`);
     }
 
