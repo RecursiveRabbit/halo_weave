@@ -16,7 +16,7 @@
  */
 
 export class PersistentStore {
-    constructor(dbName = 'halo_weave', version = 2) {
+    constructor(dbName = 'halo_weave', version = 3) {
         this.dbName = dbName;
         this.version = version;
         this.db = null;
@@ -83,6 +83,12 @@ export class PersistentStore {
                 if (!db.objectStoreNames.contains('metadata')) {
                     db.createObjectStore('metadata', { keyPath: 'key' });
                     console.log('💾 Created metadata store');
+                }
+
+                // Store 5: tool_data - Persistent JSON storage for AI tools
+                if (!db.objectStoreNames.contains('tool_data')) {
+                    db.createObjectStore('tool_data', { keyPath: 'filename' });
+                    console.log('💾 Created tool_data store');
                 }
             };
         });
@@ -789,5 +795,121 @@ export class PersistentStore {
         }
 
         console.log('💾 Import complete');
+    }
+
+    // ========== Tool Data Operations ==========
+
+    /**
+     * Save tool data (JSON storage for AI tools)
+     * @param {string} filename - The filename to store under
+     * @param {object} data - The JSON data to store
+     */
+    async saveToolData(filename, data) {
+        if (!this.db) await this.init();
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('tool_data', 'readwrite');
+            const store = tx.objectStore('tool_data');
+
+            // Store as actual JSON string
+            const record = {
+                filename: filename,
+                data: JSON.stringify(data),  // Store as JSON string
+                lastModified: new Date().toISOString()
+            };
+
+            const request = store.put(record);
+
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    /**
+     * Get tool data
+     * @param {string} filename - The filename to retrieve
+     * @returns {Promise<object|null>} The stored data or null if not found
+     */
+    async getToolData(filename) {
+        if (!this.db) await this.init();
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('tool_data', 'readonly');
+            const store = tx.objectStore('tool_data');
+            const request = store.get(filename);
+
+            request.onsuccess = () => {
+                const result = request.result;
+                if (result && result.data) {
+                    // Handle both old (object) and new (JSON string) formats
+                    if (typeof result.data === 'string') {
+                        try {
+                            // New format: Parse JSON string back to object
+                            resolve(JSON.parse(result.data));
+                        } catch (e) {
+                            console.warn('Failed to parse tool data JSON:', e);
+                            resolve(null);
+                        }
+                    } else if (typeof result.data === 'object') {
+                        // Old format: Already an object, migrate it
+                        console.log('📦 Migrating old tool data format to JSON string...');
+
+                        // Return the object for now
+                        resolve(result.data);
+
+                        // Migrate to new format in background
+                        this.saveToolData(filename, result.data).catch(err => {
+                            console.warn('Failed to migrate tool data:', err);
+                        });
+                    } else {
+                        console.warn('Unknown tool data format:', typeof result.data);
+                        resolve(null);
+                    }
+                } else {
+                    resolve(null);
+                }
+            };
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    /**
+     * Delete tool data
+     * @param {string} filename - The filename to delete
+     */
+    async deleteToolData(filename) {
+        if (!this.db) await this.init();
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('tool_data', 'readwrite');
+            const store = tx.objectStore('tool_data');
+            const request = store.delete(filename);
+
+            request.onsuccess = () => resolve();
+            request.onerror = () => reject(request.error);
+        });
+    }
+
+    /**
+     * List all tool data files
+     * @returns {Promise<Array>} List of {filename, lastModified} objects
+     */
+    async listToolData() {
+        if (!this.db) await this.init();
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction('tool_data', 'readonly');
+            const store = tx.objectStore('tool_data');
+            const request = store.getAll();
+
+            request.onsuccess = () => {
+                const results = request.result.map(r => ({
+                    filename: r.filename,
+                    lastModified: r.lastModified
+                }));
+                resolve(results);
+            };
+            request.onerror = () => reject(request.error);
+        });
     }
 }

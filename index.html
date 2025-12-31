@@ -88,6 +88,7 @@
                     <span>Tokens: <strong id="stat-tokens">0</strong></span>
                     <span>Brightness: <strong id="stat-brightness">-</strong></span>
                     <span>Pruned: <strong id="stat-pruned">0</strong></span>
+                    <button id="btn-toggle-notes" class="btn btn-small" title="Toggle Notes">📝</button>
                     <button id="btn-toggle-graveyard" class="btn btn-small" title="Toggle Graveyard">⚰️</button>
                 </div>
 
@@ -97,6 +98,23 @@
                     <button id="btn-send" class="btn btn-primary">Send</button>
                 </div>
             </main>
+
+            <!-- Notes Panel Sidebar (Right) -->
+            <aside id="notes-panel" class="notes-panel collapsed">
+                <div class="notes-header">
+                    <h2>📝 Notes</h2>
+                </div>
+                <div class="notes-content">
+                    <textarea id="notes-editor" spellcheck="false"></textarea>
+                    <div class="notes-actions">
+                        <button id="btn-notes-save" class="btn btn-small">Save</button>
+                        <button id="btn-notes-export" class="btn btn-small">Export</button>
+                        <input type="file" id="notes-import-file" accept=".json" hidden>
+                        <button id="btn-notes-import" class="btn btn-small">Import</button>
+                    </div>
+                    <p class="hint">AI-managed JSON notes. Edit with caution.</p>
+                </div>
+            </aside>
 
             <!-- Graveyard Sidebar (Right) -->
             <aside id="graveyard" class="graveyard collapsed">

@@ -57,6 +57,12 @@ export class Conversation {
         // === Mean brightness tracking ===
         // Updated during brightness scoring, used for resurrection
         this.meanBrightness = 5000;  // Default for theoretical empty-context case
+
+        // === System Prompt (External to conversation) ===
+        // Stored separately, prepended at generation time, never pruned
+        // Can grow/shrink dynamically when tools update notes
+        this.systemPromptTokens = [];  // Array of {token_id, text}
+        this.systemPromptText = '';    // Raw text for reference
     }
 
     // ========== Token Management ==========
@@ -69,13 +75,31 @@ export class Conversation {
         if (!this.store) return;
 
         console.log('📥 Loading all live tokens from IndexedDB...');
-        const tokens = await this.store.getAllLiveTokens();
+        const allTokens = await this.store.getAllLiveTokens();
 
         // Sort by position
-        tokens.sort((a, b) => a.position - b.position);
+        allTokens.sort((a, b) => a.position - b.position);
 
-        // Replace in-memory tokens with persisted ones
-        this.tokens = tokens;
+        // MIGRATION: Filter out old ST0 tokens (turn_id=0, role='system')
+        // System prompt is now stored separately in metadata.systemPromptTokens
+        const conversationTokens = allTokens.filter(t =>
+            !(t.turn_id === 0 && t.role === 'system')
+        );
+
+        const migratedCount = allTokens.length - conversationTokens.length;
+        if (migratedCount > 0) {
+            console.log(`📥 Migrated: filtered out ${migratedCount} old ST0 tokens`);
+            // Mark old ST0 tokens as deleted so they don't reappear
+            for (const token of allTokens) {
+                if (token.turn_id === 0 && token.role === 'system') {
+                    token.deleted = true;
+                    await this.store.saveToken(token);
+                }
+            }
+        }
+
+        // Replace in-memory tokens with conversation tokens only
+        this.tokens = conversationTokens;
 
         // Update nextPosition if needed
         if (this.tokens.length > 0) {
@@ -87,7 +111,7 @@ export class Conversation {
 
         this._invalidateCache();
 
-        console.log(`📥 Loaded ${tokens.length} live tokens`);
+        console.log(`📥 Loaded ${conversationTokens.length} live tokens`);
     }
 
     /**
@@ -136,6 +160,13 @@ export class Conversation {
         this.currentSentenceId = metadata.currentSentence || 0;
         this.currentRole = metadata.currentRole || null;
 
+        // Load system prompt if stored
+        if (metadata.systemPromptTokens) {
+            this.systemPromptTokens = metadata.systemPromptTokens;
+            this.systemPromptText = metadata.systemPromptText || '';
+            console.log(`📝 Loaded system prompt: ${this.systemPromptTokens.length} tokens`);
+        }
+
         console.log(`📝 Loaded metadata: position=${this.nextPosition}, turn=${this.currentTurnId}`);
     }
 
@@ -149,7 +180,10 @@ export class Conversation {
             nextPosition: this.nextPosition,
             nextTurn: this.currentTurnId,
             currentSentence: this.currentSentenceId,
-            currentRole: this.currentRole
+            currentRole: this.currentRole,
+            // System prompt stored separately from conversation tokens
+            systemPromptTokens: this.systemPromptTokens,
+            systemPromptText: this.systemPromptText
         });
     }
 
@@ -382,7 +416,18 @@ export class Conversation {
      * Get input_ids for model
      */
     getInputIds() {
-        return this.getActiveTokens().map(t => t.token_id);
+        // Prepend system prompt tokens, then conversation tokens
+        const sysIds = this.systemPromptTokens.map(t => t.token_id);
+        const convIds = this.getActiveTokens().map(t => t.token_id);
+        return [...sysIds, ...convIds];
+    }
+
+    /**
+     * Get the length of the system prompt in tokens
+     * Used for attention index offset mapping
+     */
+    getSystemPromptLength() {
+        return this.systemPromptTokens.length;
     }
 
     /**
@@ -403,7 +448,7 @@ export class Conversation {
      * @param {Object} attention - {data: Float32Array, shape: [layers, heads, contextLen], preAggregated?: boolean}
      */
     updateBrightness(attention) {
-        // Build active token list with positions in one pass
+        // Build active token list (conversation tokens only, no system prompt)
         const activeTokens = [];
         for (let i = 0; i < this.tokens.length; i++) {
             if (!this.tokens[i].deleted) {
@@ -411,22 +456,30 @@ export class Conversation {
             }
         }
 
-        const contextLen = activeTokens.length;
-        if (contextLen < 2) return;  // Need at least BOS + 1 token
+        const convLen = activeTokens.length;
+        if (convLen < 1) return;  // Need at least 1 conversation token
+
+        // System prompt offset: attention indices 0..sysLen-1 are system tokens (ignored)
+        // Conversation tokens map to attention indices sysLen..sysLen+convLen-1
+        const sysLen = this.systemPromptTokens.length;
 
         // Use pre-aggregated data if available, otherwise aggregate client-side
         const aggregated = attention.preAggregated
             ? attention.data
             : this._aggregateAttention(attention);
 
-        // O(1) threshold calculation excluding BOS
+        // Total context includes system prompt
+        const totalLen = sysLen + convLen;
+
+        // O(1) threshold calculation excluding BOS (at index 0, which is in system prompt)
+        // BOS is always at aggregated[0], part of system prompt
         const bosAttention = aggregated[0];
-        const threshold = (1.0 - bosAttention) / (contextLen - 1);
+        const threshold = (1.0 - bosAttention) / (totalLen - 1);
 
         // Skip if threshold is invalid
         if (threshold <= 0 || !isFinite(threshold)) return;
 
-        // Calculate mean brightness across all active tokens
+        // Calculate mean brightness across all active conversation tokens
         let brightnessSum = 0;
         let brightnessCount = 0;
 
@@ -441,11 +494,14 @@ export class Conversation {
         // Update mean (should always have brightnessCount > 0 in practice)
         this.meanBrightness = brightnessCount > 0 ? Math.floor(brightnessSum / brightnessCount) : 5000;
 
-        // Update scores for non-BOS tokens (activeTokens[i] is already the token)
-        const len = Math.min(aggregated.length, contextLen);
-        for (let i = 1; i < len; i++) {
+        // Update scores for conversation tokens
+        // activeTokens[i] maps to aggregated[sysLen + i]
+        for (let i = 0; i < convLen; i++) {
+            const attentionIndex = sysLen + i;
+            if (attentionIndex >= aggregated.length) break;
+
             const token = activeTokens[i];
-            const att = aggregated[i];
+            const att = aggregated[attentionIndex];
 
             if (att > threshold) {
                 // Strong reference: +ratio (e.g., 6.5x threshold → +6)

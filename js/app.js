@@ -14,6 +14,7 @@ import { Renderer } from './renderer.js';
 import { DataCapture } from './data_capture.js';
 import { SemanticIndex } from './semantic_index.js';
 import { PersistentStore } from './persistent_store.js';
+import { ToolSystem } from './tool_system.js';
 
 class App {
     constructor() {
@@ -26,6 +27,7 @@ class App {
         this.renderer = new Renderer(document.getElementById('tokens'));
         this.capture = new DataCapture();
         this.semanticIndex = new SemanticIndex({ store: this.store });
+        this.toolSystem = new ToolSystem(this.store);
         
         // Wire up renderer callbacks
         this.renderer.onPinToggle = (turnId, sentenceId, role) => {
@@ -92,7 +94,15 @@ class App {
             statPruned: document.getElementById('stat-pruned'),
             graveyard: document.getElementById('graveyard'),
             graveyardContent: document.getElementById('graveyard-content'),
-            btnToggleGraveyard: document.getElementById('btn-toggle-graveyard')
+            btnToggleGraveyard: document.getElementById('btn-toggle-graveyard'),
+            // Notes panel
+            notesPanel: document.getElementById('notes-panel'),
+            notesEditor: document.getElementById('notes-editor'),
+            btnToggleNotes: document.getElementById('btn-toggle-notes'),
+            btnNotesSave: document.getElementById('btn-notes-save'),
+            btnNotesExport: document.getElementById('btn-notes-export'),
+            btnNotesImport: document.getElementById('btn-notes-import'),
+            notesImportFile: document.getElementById('notes-import-file')
         };
         
         this._bindEvents();
@@ -149,6 +159,9 @@ class App {
         this._loadSettings();
         this._updateStats();
 
+        // Update system prompt with tool instructions
+        await this._updateSystemPrompt();
+
         // Preload embedding model in background (avoids lag on first message)
         this.semanticIndex.preloadModel().catch(err => {
             console.warn('Embedding model preload failed:', err);
@@ -196,6 +209,13 @@ class App {
         // Graveyard toggle
         this.elements.btnToggleGraveyard.addEventListener('click', () => this._toggleGraveyard());
 
+        // Notes panel
+        this.elements.btnToggleNotes.addEventListener('click', () => this._toggleNotes());
+        this.elements.btnNotesSave.addEventListener('click', () => this._saveNotes());
+        this.elements.btnNotesExport.addEventListener('click', () => this._exportNotes());
+        this.elements.btnNotesImport.addEventListener('click', () => this.elements.notesImportFile.click());
+        this.elements.notesImportFile.addEventListener('change', (e) => this._importNotes(e));
+
         // Save settings on change
         ['maxTokens', 'temperature', 'topP', 'maxContext', 'systemPrompt'].forEach(key => {
             this.elements[key].addEventListener('change', () => this._saveSettings());
@@ -212,17 +232,10 @@ class App {
         this.elements.btnSend.disabled = true;
         
         try {
-            // Add system prompt if this is the first message
-            if (this.conversation.tokens.length === 0) {
-                const systemPrompt = this.elements.systemPrompt.value.trim();
-                if (systemPrompt) {
-                    console.log('📤 Adding system prompt...');
-                    await this._addMessage('system', systemPrompt);
-                    console.log('📤 System prompt added');
-                    // Increment turn after system prompt (system=turn0, user will be turn1)
-                    this.conversation.nextTurn();
-                }
-            }
+            // Tokenize system prompt before first message (and on every send to catch updates)
+            // System prompt is stored separately, NOT in conversation.tokens
+            await this._updateSystemPrompt();        // Update textarea with tool state
+            await this._updateSystemPromptTokens();  // Tokenize to separate array
 
             // Query graveyard for relevant context before adding user message
             await this._resurrectRelevantContext(text);
@@ -237,9 +250,37 @@ class App {
             // Only clear input after user message successfully added (tokenization worked)
             this.elements.userInput.value = '';
             
-            // Generate response
+            // Generate response with tool loop
+            // Model generates, we process tools, then model continues until no more tools
+            const MAX_TOOL_ITERATIONS = 5;  // Safety limit
+            let iteration = 0;
+            const processedToolCalls = new Set();  // Track already-processed tool calls
+
+            // First generation (with AI prefix)
             await this._generate();
-            
+
+            // Check for tools and continue if needed
+            while (iteration < MAX_TOOL_ITERATIONS) {
+                // Process any NEW tool calls (skip already processed ones)
+                const toolsExecuted = await this._processToolCalls(processedToolCalls);
+
+                if (!toolsExecuted) {
+                    // No new tools - generation is complete
+                    break;
+                }
+
+                // Tools were executed - continue generation
+                iteration++;
+                console.log(`🔄 Tool iteration ${iteration}: continuing generation after tool execution...`);
+
+                // Continue generation from current context (no new prefix, same assistant turn)
+                await this._continueGeneration();
+            }
+
+            if (iteration >= MAX_TOOL_ITERATIONS) {
+                console.warn(`⚠️ Tool iteration limit (${MAX_TOOL_ITERATIONS}) reached`);
+            }
+
             // End assistant turn
             this.conversation.nextTurn();
 
@@ -767,8 +808,131 @@ class App {
             console.warn('Failed to add end token:', err);
         }
 
+        // Tool processing moved to _handleSend loop for continuation support
+
         this._updateStats();
         console.log('🔓 _generate() complete');
+    }
+
+    /**
+     * Continue generation after tool execution (no AI prefix, same turn)
+     */
+    async _continueGeneration() {
+        console.log('🔄 _continueGeneration() starting...');
+
+        // Build prompt from active tokens (includes tool results)
+        const inputIds = this.conversation.getInputIds();
+
+        // Generation config - same as _generate()
+        const config = {
+            maxNewTokens: parseInt(this.elements.maxTokens.value),
+            temperature: parseFloat(this.elements.temperature.value),
+            topP: parseFloat(this.elements.topP.value),
+            returnAttention: true
+        };
+
+        this.generationStep = 0;
+
+        // Timing stats
+        this._timingStats = {
+            addToken: 0,
+            updateBrightness: 0,
+            updateColors: 0,
+            renderToken: 0,
+            capture: 0,
+            pruning: 0,
+            stats: 0,
+            total: 0,
+            count: 0,
+            lastTokenTime: performance.now(),
+            tokenGaps: 0,
+            startTime: performance.now(),
+            attentionSize: 0
+        };
+
+        // Stream generation (identical to _generate except no prefix)
+        await new Promise((resolve, reject) => {
+            this.client.generateStream(
+                inputIds,
+                config,
+                async (tokenId, text, attention) => {
+                    const t0 = performance.now();
+                    this._timingStats.tokenGaps += t0 - this._timingStats.lastTokenTime;
+
+                    if (tokenId === null || tokenId === undefined) {
+                        console.warn('Skipping token with null/undefined ID:', { tokenId, text });
+                        return;
+                    }
+
+                    let t1 = performance.now();
+                    const token = this.conversation.addStreamingToken(tokenId, text);
+                    this._timingStats.addToken += performance.now() - t1;
+
+                    if (attention) {
+                        this._timingStats.attentionSize = attention.data.length * 4;
+
+                        t1 = performance.now();
+                        this.conversation.updateBrightness(attention);
+                        this._timingStats.updateBrightness += performance.now() - t1;
+
+                        t1 = performance.now();
+                        const stats = this.conversation.getStats();
+                        this.renderer.updateColors(this.conversation, {
+                            minBrightness: stats.minBrightness,
+                            maxBrightness: stats.maxBrightness
+                        });
+                        this._timingStats.updateColors += performance.now() - t1;
+
+                        if (this.capture.isCapturing) {
+                            t1 = performance.now();
+                            this.capture.recordGeneratedToken(token, attention, this.generationStep)
+                                .catch(err => console.warn('Capture error:', err));
+                            this._timingStats.capture += performance.now() - t1;
+                        }
+                    }
+
+                    t1 = performance.now();
+                    this.renderer.addToken(token, this.conversation);
+                    this._timingStats.renderToken += performance.now() - t1;
+
+                    t1 = performance.now();
+                    this._updateStats();
+                    this._timingStats.stats += performance.now() - t1;
+
+                    this._timingStats.total += performance.now() - t0;
+                    this._timingStats.count++;
+                    this._timingStats.lastTokenTime = performance.now();
+                    this.generationStep++;
+                },
+                async (data) => {
+                    console.log('Continuation complete:', data);
+
+                    // Persist brightness updates
+                    if (this.store) {
+                        const activeTokens = this.conversation.getActiveTokens();
+                        for (const token of activeTokens) {
+                            this.store.saveToken(token).catch(err => {
+                                console.warn('Failed to persist token brightness:', err);
+                            });
+                        }
+                    }
+
+                    // Index new chunks
+                    await this.semanticIndex.indexNewChunks(this.conversation);
+
+                    // Check pruning
+                    this._checkPruning();
+
+                    resolve();
+                },
+                (error) => {
+                    console.error('Continuation error:', error);
+                    reject(error);
+                }
+            );
+        });
+
+        console.log('🔓 _continueGeneration() complete');
     }
 
     _checkPruning() {
@@ -1058,10 +1222,88 @@ class App {
     _toggleGraveyard() {
         const isCollapsed = this.elements.graveyard.classList.toggle('collapsed');
 
-        // Update graveyard content when opening
+        // If opening graveyard, close notes panel (mutually exclusive)
         if (!isCollapsed) {
+            this.elements.notesPanel.classList.add('collapsed');
             this._updateGraveyard();
         }
+    }
+
+    _toggleNotes() {
+        const isCollapsed = this.elements.notesPanel.classList.toggle('collapsed');
+
+        // If opening notes, close graveyard (mutually exclusive)
+        if (!isCollapsed) {
+            this.elements.graveyard.classList.add('collapsed');
+            this._refreshNotesEditor();
+        }
+    }
+
+    /**
+     * Refresh the notes editor with current notes content
+     */
+    async _refreshNotesEditor() {
+        try {
+            const notes = await this.toolSystem.getNotesContent();
+            this.elements.notesEditor.value = JSON.stringify(notes, null, 2);
+        } catch (err) {
+            console.error('Failed to load notes:', err);
+            this.elements.notesEditor.value = '// Error loading notes: ' + err.message;
+        }
+    }
+
+    /**
+     * Save notes from the editor (validates JSON, updates system prompt)
+     */
+    async _saveNotes() {
+        try {
+            const content = JSON.parse(this.elements.notesEditor.value);
+            await this.toolSystem.setNotesContent(content);
+            await this._updateSystemPrompt();        // Update textarea
+            await this._updateSystemPromptTokens();  // Re-tokenize
+            console.log('📝 Notes saved manually');
+            this._setStatus('Notes saved', 'connected');
+        } catch (e) {
+            console.error('Failed to save notes:', e);
+            alert('Invalid JSON: ' + e.message);
+        }
+    }
+
+    /**
+     * Export notes to a JSON file
+     */
+    _exportNotes() {
+        const content = this.elements.notesEditor.value;
+        const blob = new Blob([content], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `notes_${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    /**
+     * Import notes from a JSON file
+     */
+    async _importNotes(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        try {
+            const text = await file.text();
+            const content = JSON.parse(text);
+            await this.toolSystem.setNotesContent(content);
+            await this._updateSystemPrompt();
+            await this._updateSystemPromptTokens();
+            await this._refreshNotesEditor();
+            console.log('📝 Notes imported from file');
+            this._setStatus('Notes imported', 'connected');
+        } catch (e) {
+            console.error('Failed to import notes:', e);
+            alert('Invalid JSON file: ' + e.message);
+        }
+        event.target.value = '';  // Reset for re-import
     }
 
     /**
@@ -1401,6 +1643,220 @@ class App {
         this._updateStats();
 
         console.log(`✅ Deleted turn pair: ${userSentences.length + assistantSentences.length} chunks removed`);
+    }
+
+    // ========== Tool Processing ==========
+
+    /**
+     * Process tool calls in the assistant's last response
+     * @param {Set} processedToolCalls - Set of already-processed tool call strings (to avoid re-processing)
+     * @returns {boolean} True if any NEW tool calls were executed
+     */
+    async _processToolCalls(processedToolCalls = new Set()) {
+        // Get the current assistant turn
+        // When this is called, we're still on the assistant's turn (before nextTurn is called)
+        // Assistant turns are EVEN (2, 4, 6...)
+        const sentences = this.conversation.getSentences();
+        const currentAssistantTurn = this.conversation.currentTurnId;
+
+        console.log(`🔧 Looking for assistant sentences on turn ${currentAssistantTurn}`);
+
+        const assistantSentences = sentences.filter(s =>
+            s.role === 'assistant' &&
+            s.turn_id === currentAssistantTurn
+        );
+
+        if (assistantSentences.length === 0) {
+            console.log('🔧 No assistant sentences found for tool processing');
+            return false;
+        }
+
+        // Reconstruct the full assistant response
+        let fullResponse = '';
+        for (const sentence of assistantSentences) {
+            const text = this.conversation.reconstructText(sentence.tokens);
+            fullResponse += text;
+        }
+
+        console.log('🔧 Checking for tool calls in response:', fullResponse.substring(0, 200) + '...');
+
+        // Detect tool calls
+        const allToolCalls = this.toolSystem.detectToolCalls(fullResponse);
+
+        // Filter out already-processed tool calls
+        const toolCalls = allToolCalls.filter(call => !processedToolCalls.has(call.raw));
+
+        if (toolCalls.length === 0) {
+            console.log(`🔧 No NEW tool calls (${allToolCalls.length} already processed)`);
+            return false;
+        }
+
+        console.log(`🔧 Found ${toolCalls.length} NEW tool call(s) (${allToolCalls.length - toolCalls.length} already processed)`);
+
+        // Track if we modified the notes
+        let notesModified = false;
+
+        // Process each tool call
+        for (const call of toolCalls) {
+            console.log(`🔧 Processing: ${call.command}`);
+
+            // Mark as processed BEFORE executing (prevents re-processing on next iteration)
+            processedToolCalls.add(call.raw);
+
+            // Parse the command
+            const parsed = this.toolSystem.parseCommand(call.command);
+
+            // Execute the command
+            const result = await this.toolSystem.executeCommand(parsed);
+
+            // Track if this was a write operation (patch commands)
+            if (result.isWrite && result.success) {
+                notesModified = true;
+            }
+
+            // Format the result
+            const formattedResult = this.toolSystem.formatResult(result);
+
+            // Add tool result as conversation tokens
+            await this._addToolResultAsTokens(call.raw, formattedResult);
+        }
+
+        // If notes were modified, update the system prompt to reflect new state
+        if (notesModified) {
+            console.log('📝 Notes modified, updating system prompt...');
+            await this._updateSystemPrompt();        // Update textarea
+            await this._updateSystemPromptTokens();  // Re-tokenize for next generation
+        }
+
+        return true;  // Tools were executed
+    }
+
+    /**
+     * Add tool result as proper conversation tokens
+     * Uses text markers that survive tokenization: ⚙️【command】→ result
+     */
+    async _addToolResultAsTokens(toolCall, result) {
+        // Extract the command from <tool>...</tool>
+        const commandMatch = toolCall.match(/<tool>([\s\S]*?)<\/tool>/);
+        const command = commandMatch ? commandMatch[1].trim() : toolCall;
+
+        // Truncate long commands (e.g., multi-line patch operations) for display
+        const displayCommand = command.length > 100
+            ? command.substring(0, 100) + '...'
+            : command;
+
+        // Create compact text with markers that survive tokenization
+        // Format: ⚙️【read notes.json】→ {...} or ⚙️【patch notes.json...】→ ✓ add /path
+        const combinedText = `\n⚙️【${displayCommand}】→ ${result}\n`;
+
+        // Tokenize the result
+        const tokens = await this.client.tokenize(combinedText);
+
+        // DON'T increment sentence_id - tool result stays in same chunk as tool call
+        // This ensures <tool>...</tool> and ⚙️【】→ result are indexed together
+
+        // Add tokens to the conversation
+        for (const t of tokens) {
+            const token = this.conversation.addStreamingToken(t.token_id, t.text);
+
+            // Set proper metadata
+            token.role = 'assistant';
+            token.turn_id = this.conversation.currentTurnId;  // We're still on the assistant turn
+
+            // Mark as tool result for special rendering
+            token.isToolResult = true;
+
+            // Render the token
+            this.renderer.addToken(token, this.conversation);
+
+            // Persist to database (fire-and-forget)
+            this.store.saveToken(token).catch(err => {
+                console.warn('Failed to persist tool result token:', err);
+            });
+        }
+
+        // Update stats
+        this._updateStats();
+
+        console.log(`🔧 Added tool result as ${tokens.length} tokens in conversation`);
+    }
+
+    /**
+     * Escape HTML to prevent XSS
+     */
+    _escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    /**
+     * Update system prompt to include tool instructions
+     */
+    async _updateSystemPrompt() {
+        const currentPrompt = this.elements.systemPrompt.value;
+
+        // Get the dynamic tool instructions with current state
+        const toolInstructions = await this.toolSystem.getSystemPromptAddition(true);
+
+        // Only add if not already present
+        if (!currentPrompt.includes('## Tool Use')) {
+            this.elements.systemPrompt.value = currentPrompt + '\n\n' + toolInstructions;
+            this._saveSettings();
+        } else {
+            // Update the existing tool section with current state
+            // Find and replace the tool use section
+            const startMarker = '## Tool Use';
+            const endMarker = 'Always use tool calls when you need to remember something important or retrieve previously stored information.';
+
+            const startIdx = currentPrompt.indexOf(startMarker);
+            if (startIdx !== -1) {
+                const endIdx = currentPrompt.indexOf(endMarker);
+                if (endIdx !== -1) {
+                    const beforeTools = currentPrompt.substring(0, startIdx).trimEnd();
+                    const afterTools = currentPrompt.substring(endIdx + endMarker.length);
+
+                    this.elements.systemPrompt.value = beforeTools + '\n\n' + toolInstructions + afterTools;
+                    this._saveSettings();
+                }
+            }
+        }
+    }
+
+    /**
+     * Refresh the system prompt with updated notes state
+     * Call this after tool executions modify the notes
+     */
+    async _refreshSystemPrompt() {
+        await this._updateSystemPrompt();
+    }
+
+    /**
+     * Tokenize the system prompt and store in conversation.systemPromptTokens
+     * This is separate from the conversation history - prepended at generation time
+     * Can be called any time to update (e.g., after tools modify notes)
+     */
+    async _updateSystemPromptTokens() {
+        // Get current system prompt text (includes tool instructions)
+        const systemPrompt = this.elements.systemPrompt.value.trim();
+        if (!systemPrompt) {
+            this.conversation.systemPromptTokens = [];
+            this.conversation.systemPromptText = '';
+            console.log('🔄 System prompt cleared (empty)');
+            return;
+        }
+
+        // Format with ChatML
+        const formatted = `<|im_start|>system\n${systemPrompt}<|im_end|>\n`;
+
+        // Tokenize
+        const tokens = await this.client.tokenize(formatted);
+
+        // Update conversation's system prompt tokens
+        this.conversation.systemPromptTokens = tokens;
+        this.conversation.systemPromptText = systemPrompt;
+
+        console.log(`🔄 System prompt tokenized: ${tokens.length} tokens`);
     }
 }
 

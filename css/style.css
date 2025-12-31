@@ -347,8 +347,12 @@ body {
     color: var(--text);
 }
 
-.stats #btn-toggle-graveyard {
+.stats #btn-toggle-notes {
     margin-left: auto;
+    font-size: 1rem;
+}
+
+.stats #btn-toggle-graveyard {
     font-size: 1rem;
 }
 
@@ -482,3 +486,86 @@ body {
     display: flex;
     justify-content: space-between;
 }
+
+/* Notes Panel Sidebar (Right) */
+.notes-panel {
+    width: 320px;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border);
+    background: var(--bg-panel);
+    transition: width 0.3s ease, opacity 0.3s ease;
+}
+
+.notes-panel.collapsed {
+    width: 0;
+    opacity: 0;
+    overflow: hidden;
+}
+
+.notes-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.notes-header h2 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin: 0;
+}
+
+.notes-content {
+    flex: 1;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#notes-editor {
+    flex: 1;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    resize: none;
+    padding: 0.75rem;
+    min-height: 200px;
+}
+
+#notes-editor:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.notes-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+}
+
+.notes-actions .btn {
+    flex: 1;
+}
+
+/* Tool Results - Now rendered as tokens */
+.tool-result-token {
+    color: #90ee90 !important;  /* Light green */
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+/* Optional: Add a subtle background to tool result chunks */
+.sentence:has(.tool-result-token) {
+    background: rgba(144, 238, 144, 0.05);
+    border-left: 2px solid #90ee90;
+    padding-left: 0.5rem;
+    margin-left: -0.5rem;
+}
+
+/* Removed old tool-command, tool-label, tool-output styles since tool results are now tokens */

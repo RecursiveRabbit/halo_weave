@@ -123,14 +123,23 @@ export class Renderer {
             for (const token of sentence.tokens) {
                 const el = this.tokenElements.get(token.position);
                 if (!el) continue;
-                
+
                 if (token.deleted) {
                     if (!el.classList.contains('deleted')) {
                         el.classList.add('deleted');
                     }
                     continue;
                 }
-                
+
+                // Tool result tokens keep their distinctive cyan color
+                // Check both the flag and text markers for robustness
+                const isToolToken = token.isToolResult || this._isToolMarkerToken(token.text);
+                if (isToolToken) {
+                    el.style.color = '#4ecdc4';  // Cyan for tool tokens
+                    el.style.backgroundColor = 'rgba(78, 205, 196, 0.1)';
+                    continue;
+                }
+
                 const lastB = this.lastBrightness.get(token.position);
                 const currentB = token.brightness;
 
@@ -171,14 +180,24 @@ export class Renderer {
     addToken(token, conversation) {
         this._ensureTurnElement(token.turn_id, token.role);
         const sentenceEl = this._ensureSentenceElement(token.turn_id, token.sentence_id, token.role);
-        
+
         const span = document.createElement('span');
         span.className = 'token';
         span.dataset.position = token.position;
-        span.style.color = this._brightnessToYellow(token.brightness);
         span.textContent = token.text;
-        span.title = `pos:${token.position} b:${token.brightness}`;
-        
+
+        // Tool result tokens get distinctive cyan color
+        const isToolToken = token.isToolResult || this._isToolMarkerToken(token.text);
+        if (isToolToken) {
+            span.classList.add('tool-result-token');
+            span.style.color = '#4ecdc4';  // Cyan for tool tokens
+            span.style.backgroundColor = 'rgba(78, 205, 196, 0.1)';
+            span.title = `pos:${token.position} b:${token.brightness} [tool]`;
+        } else {
+            span.style.color = this._brightnessToYellow(token.brightness);
+            span.title = `pos:${token.position} b:${token.brightness}`;
+        }
+
         sentenceEl.appendChild(span);
         this.tokenElements.set(token.position, span);  // Cache for O(1) lookup
     }
@@ -355,17 +374,26 @@ export class Renderer {
             const span = document.createElement('span');
             span.className = 'token' + (token.deleted ? ' deleted' : '');
             span.dataset.position = token.position;
-            span.style.color = paragraphColor;  // All tokens same shade
             span.textContent = token.text;
-            span.title = `pos:${token.position} b:${token.brightness}`;
-            
-            // Bright tokens get white text + yellow background
-            if (token.brightness > 255) {
-                span.style.color = '#ffffff';  // Override paragraph color
-                const highlightAlpha = Math.min(0.5, (token.brightness - 255) / 1000 * 0.5);
-                span.style.backgroundColor = `rgba(255, 200, 50, ${highlightAlpha.toFixed(3)})`;
+
+            // Tool result tokens get distinctive cyan color
+            const isToolToken = token.isToolResult || this._isToolMarkerToken(token.text);
+            if (isToolToken) {
+                span.style.color = '#4ecdc4';  // Cyan for tool tokens
+                span.style.backgroundColor = 'rgba(78, 205, 196, 0.1)';
+                span.title = `pos:${token.position} b:${token.brightness} [tool]`;
+            } else {
+                span.style.color = paragraphColor;  // All tokens same shade
+                span.title = `pos:${token.position} b:${token.brightness}`;
+
+                // Bright tokens get white text + yellow background
+                if (token.brightness > 255) {
+                    span.style.color = '#ffffff';  // Override paragraph color
+                    const highlightAlpha = Math.min(0.5, (token.brightness - 255) / 1000 * 0.5);
+                    span.style.backgroundColor = `rgba(255, 200, 50, ${highlightAlpha.toFixed(3)})`;
+                }
             }
-            
+
             sentenceEl.appendChild(span);
             this.tokenElements.set(token.position, span);  // Cache for O(1) lookup
         }
@@ -412,6 +440,16 @@ export class Renderer {
         }
 
         return `rgb(${r}, ${g}, ${blue})`;
+    }
+
+    /**
+     * Check if token text contains tool markers
+     * Used for text-based detection that survives import/export
+     * Markers: ⚙️ 【 】 → ✓ ❌
+     */
+    _isToolMarkerToken(text) {
+        // Check for the distinctive markers we use
+        return /[⚙️【】→✓❌]/.test(text);
     }
 
     /**
