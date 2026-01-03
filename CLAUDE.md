@@ -110,6 +110,9 @@ Renderer.addToken() - immediate visual feedback
 Generation complete
        │
        ▼
+Process tool calls (if any) - execute jq commands, update JSON storage
+       │
+       ▼
 SemanticIndex.indexNewChunks() - embed all new chunks with turn-pair context
        │
        ▼
@@ -689,6 +692,86 @@ Connect to KoboldCPP
 - All DB writes complete before user can send next message
 - Invariant restored: UI = DB
 
+### 12. Tool System (tool_system.js)
+
+**Purpose:** Give the AI persistent note-taking ability through a familiar jq-like interface.
+
+**Architecture:**
+- Tool calls embedded in assistant responses: `<tool>jq command</tool>`
+- Simplified jq parser supporting common operations
+- Persistent JSON storage in IndexedDB (`tool_data` store)
+- **Compact results** - Shows only path/value changed, not full JSON
+- **Text markers** - Results use `⚙️【command】→ result` format that survives tokenization
+- **Continuation loop** - Model continues generating after tool execution (up to 5 iterations)
+
+**Supported Operations:**
+
+**Reading:**
+```bash
+<tool>jq '.' notes.json</tool>                    # Show entire file
+<tool>jq '.topics' notes.json</tool>              # Get specific field
+<tool>jq '.array[0]' notes.json</tool>            # Array index access
+```
+
+**Writing (requires `> output`):**
+```bash
+<tool>jq '.field = "value"' notes.json > output</tool>           # Set field
+<tool>jq '.array += ["item"]' notes.json > output</tool>         # Append to array
+<tool>jq '. + {"new": "field"}' notes.json > output</tool>       # Merge object
+<tool>jq 'del(.field)' notes.json > output</tool>                # Delete field
+```
+
+**Notes Structure:**
+```json
+{
+  "_metadata": {
+    "created": "ISO timestamp",
+    "last_modified": "ISO timestamp",
+    "description": "AI assistant's persistent notes"
+  },
+  "topics": {},      // Topic-keyed information
+  "reminders": [],   // List of reminders
+  "context": {},     // Contextual information
+  "scratch": {}      // Temporary workspace
+}
+```
+
+**Processing Flow:**
+```
+Generation completes
+       │
+       ▼
+_processToolCalls() detects <tool>...</tool> tags
+       │
+       ▼
+Execute each tool via ToolSystem
+       │
+       ▼
+Add compact result as tokens: ⚙️【command】→ ✓ .path = "value"
+       │
+       ▼
+Tools executed? ────Yes────► _continueGeneration() ────┐
+       │                                               │
+       No                                              │
+       │                                               │
+       ▼                                               │
+Generation complete ◄─────────────────────────────────┘
+                           (up to 5 iterations)
+```
+
+**Key Features:**
+- **Persistent across sessions** - Notes survive browser refresh
+- **Familiar interface** - Uses jq syntax already in training data
+- **Safe execution** - Limited to JSON manipulation, no system access
+- **Compact results** - `✓ .context.name = "value"` instead of full JSON dump
+- **Text markers** - `⚙️【】→✓❌` survive brightness scoring and tokenization
+- **Continuation loop** - Model can use multiple tools and continue reasoning
+
+**UI Styling:**
+- Tool result tokens rendered in **cyan** (#4ecdc4) with subtle background
+- Markers detected via text pattern matching (survives import/export)
+- Color persists through brightness updates (not overwritten)
+
 ---
 
 ## Development Guidelines
@@ -1055,17 +1138,19 @@ The client decodes the base64 data and aggregates across layers and heads to pro
 - [x] **Semantic index uniqueness constraint error** - Fixed saveSemanticEntry() to do proper upsert (check for existing record before insert) ✅ Fixed 2025-12-26
 - [x] **Conversation not rehydrating on startup** - Added loadAllLiveTokensFromStore() to restore conversation from IndexedDB ✅ Fixed 2025-12-26
 - [x] **Graveyard toggle button unreachable** - Moved toggle button from inside collapsible graveyard to stats bar ✅ Fixed 2025-12-26
+- [x] **End token tokenization hanging** - `<|im_end|>` tokenization after generation sometimes hangs. Currently commented out in app.js. ✅ Fixed 2025-12-29
 
 ### Bugs to Investigate
 
-- [ ] **End token tokenization hanging** - `<|im_end|>` tokenization after generation sometimes hangs. Currently commented out in app.js.
+
 
 ### Future Improvements
 
 **Short Term:**
 - [ ] Add visual settings (font size, color scheme)
-- [ ] Add Timestamps to user turns.
-- [ ] Manual chunk deletion from UI (currently can only prune via brightness)
+- [ ] Currently we don't count attention for current turn, this is a holdover from a past version. We should allow current turn tokens to accrue attention and decay. 
+- [x] Add Timestamps to user turns.✅ Implemented 2025-12-29
+- [x] Manual chunk deletion from UI (currently can only prune via brightness)
 - [x] **Manual resurrection from graveyard** - Click pruned chunks to resurrect ✅ Implemented 2025-12-26
 - [x] **Auto-pin on manual resurrection** - User resurrection signals importance ✅ Implemented 2025-12-26
 - [x] **Anchor-protected pruning** - S0 chunks from turn pairs must prune together ✅ Implemented 2025-12-26

@@ -1,10 +1,10 @@
 # KoboldCPP Attention Extraction API - TESTED DOCUMENTATION
 ## Real API Responses and Working Endpoints
 
-**Version**: 3.1 (Model Info Edition)
-**Date**: 2025-11-19
+**Version**: 3.2 (Hidden State Edition)
+**Date**: 2026-01-01
 **Status**: ✅ **VERIFIED WORKING** - All endpoints tested with live server
-**Model Tested**: Qwen2.5-VL-7B-Instruct-Q8_0 (28 layers, 28 heads)
+**Models Tested**: Qwen2.5-VL-7B-Instruct-Q8_0, Qwen3-Coder-30B-A3B
 
 ---
 
@@ -42,6 +42,13 @@
 - Enables deterministic token control for context pruning
 - Works with both streaming and non-streaming endpoints
 
+### ✅ Phase 6: Hidden State Extraction (COMPLETE - Session 11)
+- `output_hidden_states` parameter for semantic embeddings
+- Extracts final-layer hidden states during token generation
+- Shape: `[n_embd]` per token (e.g., 2048 for Qwen3-30B, 3584 for Qwen2.5-7B)
+- Base64-encoded float32 for SSE streaming
+- Use case: Semantic embeddings for RAG-based context resurrection
+
 
 ### ⚠️ What Doesn't Exist
 - No non-streaming `/api/v1/generate` endpoint with attention data exposure
@@ -58,6 +65,14 @@
 - **Size**: ~1.07MB per token (base64-encoded) for 28L/28H model
 - **Encoding**: base64 string in JSON
 - **Note**: First generated token may not have attention data
+
+### Hidden State Extraction (NEW - Session 11)
+- **Format**: Final-layer transformer hidden states (raw float32)
+- **Shape**: `[n_embd]` per generated token
+- **Size**: ~8KB raw / ~11KB base64 per token (for 2048-dim model)
+- **Encoding**: base64 string in JSON
+- **Use Case**: Semantic embeddings for RAG-based context resurrection
+- **Note**: Only extracted during single-token generation, not prompt processing
 
 ### Streaming Generation
 - **Protocol**: Server-Sent Events (SSE)
@@ -282,11 +297,12 @@ data: {"token": "", "finish_reason": "length"}
 
 **Request Parameters**:
 - `prompt` (string): Text prompt (ignored if `input_ids` is provided)
-- `input_ids` (array of int32): **NEW** - Pre-tokenized token IDs (bypasses tokenization)
+- `input_ids` (array of int32): Pre-tokenized token IDs (bypasses tokenization)
 - `max_length` (int): Maximum tokens to generate
 - `temperature` (float): Sampling temperature
 - `sampler_seed` (int): Random seed for reproducibility
 - `output_attentions` (bool): Enable attention extraction
+- `output_hidden_states` (bool): **NEW** - Enable hidden state extraction for semantic embeddings
 - `request_id` (string): Optional request tracking ID
 
 **Notes**:
@@ -390,6 +406,75 @@ attention = attention.reshape(attention_info["shape"])
 
 ---
 
+## Decoding Hidden State Data (Python Example)
+
+**Token Event with Hidden State** (ACTUAL response format):
+```json
+{
+  "type": "token",
+  "token": {
+    "token_id": 4330,
+    "text": "ato"
+  },
+  "request_id": "test-123",
+  "hidden_state": {
+    "shape": [2048],
+    "encoding": "base64",
+    "dtype": "float32",
+    "data": "sNCcP7KRvj..."
+  }
+}
+```
+
+**Client decodes**:
+```python
+import numpy as np
+import base64
+
+# Parse JSON response
+token_event = json.loads(event_data)
+hidden_info = token_event.get("hidden_state")
+
+if hidden_info:
+    # Decode base64 to bytes
+    hidden_bytes = base64.b64decode(hidden_info["data"])
+
+    # Convert to numpy array
+    hidden_state = np.frombuffer(hidden_bytes, dtype=np.float32)
+
+    # Result: numpy array with shape [n_embd], e.g., [2048] for Qwen3-30B
+    # This is the semantic embedding for the generated token
+    print(f"Embedding dim: {len(hidden_state)}")
+    print(f"L2 norm: {np.linalg.norm(hidden_state):.2f}")
+```
+
+**Use Case - Semantic Index for RAG**:
+```python
+# Store embeddings for generated tokens
+semantic_index = []
+
+for token_event in stream_tokens():
+    if token_event.get("hidden_state"):
+        hidden = decode_hidden_state(token_event["hidden_state"])
+        semantic_index.append({
+            "token_id": token_event["token"]["token_id"],
+            "text": token_event["token"]["text"],
+            "embedding": hidden
+        })
+
+# Later: Use embeddings for semantic search when resurrecting pruned context
+query_embedding = get_query_embedding()
+similarities = [np.dot(query_embedding, t["embedding"]) for t in semantic_index]
+```
+
+**Notes**:
+- Hidden states are only extracted during token generation, not prompt processing
+- First token after prompt may have `hidden_state: null`
+- Embedding dimension matches model's hidden size (check `embedding_size` in `/api/v1/model`)
+- Memory: ~8KB raw / ~11KB base64 per token (for 2048-dim model)
+
+---
+
 ## Complete Working Example (Tested)
 
 **Start the server**:
@@ -457,13 +542,14 @@ for line in response.iter_lines():
 1. **GET /api/v1/model** - Returns comprehensive model architecture details
 2. **POST /api/v1/tokenize** - Tokenize text to token IDs + text
 3. **POST /api/v1/detokenize** - Convert token IDs back to text
-4. **POST /api/extra/generate/stream** - SSE streaming with base64 attention
+4. **POST /api/extra/generate/stream** - SSE streaming with attention and hidden states
 5. Attention extraction: Post-softmax probabilities, shape `[layers, heads, context]`
-6. Request ID tracking
-7. `input_ids` parameter for direct token input
+6. Hidden state extraction: Semantic embeddings, shape `[n_embd]`
+7. Request ID tracking
+8. `input_ids` parameter for direct token input
 
 ### What Doesn't Exist ❌
-- No non-streaming generation with attention
+- No non-streaming generation with attention/hidden states
 
 ### For Halo Weave Integration
 - ✅ Model metadata available via `/api/v1/model` (architecture validation)
@@ -471,11 +557,13 @@ for line in response.iter_lines():
 - ✅ Detokenization available via `/api/v1/detokenize` (for reconstruction)
 - ✅ Special token IDs exposed (BOS, EOS, EOT) for proper handling
 - ✅ Attention shape validation: use `num_layers` and `num_attention_heads` from model info
+- ✅ Hidden state extraction for semantic embeddings (use `embedding_size` for dimension)
 - Client must map attention indices to conversation positions
 - Attention is indexed by input prompt array position
 - KV cache cannot survive pruning - must reprocess context after pruning
 - ✅ `input_ids` parameter available for direct token input
 - ✅ SSE streaming with base64-encoded attention tensors
+- ✅ SSE streaming with base64-encoded hidden states (semantic embeddings)
 
 **Backup of Original Spec**: See `KOBOLD_API_SPEC_ASPIRATIONAL.md` for the original design document with planned features.
 
@@ -517,6 +605,6 @@ response = requests.post("http://localhost:5001/api/extra/generate/stream",
 
 ---
 
-**Last Updated**: 2025-12-21
-**Tested With**: Qwen2.5-VL-7B-Instruct-Q8_0 (28L, 28H, Q8_0 quantization)
-**Server**: koboldcpp with custom attention extraction + tokenization + input_ids patches
+**Last Updated**: 2026-01-01
+**Tested With**: Qwen2.5-VL-7B-Instruct-Q8_0 (28L, 28H), Qwen3-Coder-30B-A3B (2048 embd)
+**Server**: koboldcpp with custom attention extraction + hidden state extraction + tokenization + input_ids patches
