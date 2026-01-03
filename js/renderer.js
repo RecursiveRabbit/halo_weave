@@ -135,8 +135,7 @@ export class Renderer {
                 // Check both the flag and text markers for robustness
                 const isToolToken = token.isToolResult || this._isToolMarkerToken(token.text);
                 if (isToolToken) {
-                    el.style.color = '#4ecdc4';  // Cyan for tool tokens
-                    el.style.backgroundColor = 'rgba(78, 205, 196, 0.1)';
+                    this._applyToolTokenStyling(el);
                     continue;
                 }
 
@@ -186,8 +185,7 @@ export class Renderer {
         const isToolToken = token.isToolResult || this._isToolMarkerToken(token.text);
         if (isToolToken) {
             span.classList.add('tool-result-token');
-            span.style.color = '#4ecdc4';  // Cyan for tool tokens
-            span.style.backgroundColor = 'rgba(78, 205, 196, 0.1)';
+            this._applyToolTokenStyling(span);
             span.title = `pos:${token.position} b:${token.brightness} [tool]`;
         } else {
             span.style.color = this._brightnessToYellow(token.brightness);
@@ -196,37 +194,6 @@ export class Renderer {
 
         sentenceEl.appendChild(span);
         this.tokenElements.set(token.position, span);  // Cache for O(1) lookup
-    }
-
-    /**
-     * Mark sentences as deleted (visual fade before removal)
-     * @param {Array} sentences - Sentences that were pruned
-     */
-    markDeleted(sentences) {
-        for (const sentence of sentences) {
-            for (const token of sentence.tokens) {
-                const el = this.tokenElements.get(token.position);
-                if (el) {
-                    el.classList.add('deleted');
-                }
-            }
-        }
-    }
-
-    /**
-     * Remove deleted tokens from DOM
-     */
-    removeDeleted() {
-        const deleted = this.container.querySelectorAll('.token.deleted');
-        deleted.forEach(el => el.remove());
-        
-        // Clean up empty turn containers
-        this.turnElements.forEach((el, turnId) => {
-            if (el.querySelectorAll('.token').length === 0) {
-                el.remove();
-                this.turnElements.delete(turnId);
-            }
-        });
     }
 
     /**
@@ -364,7 +331,10 @@ export class Renderer {
         const maxB = options.maxBrightness !== undefined ? options.maxBrightness : 10000;
 
         const paragraphColor = this._brightnessToYellow(peakBrightness, minB, maxB);
-        
+
+        // Calculate dynamic bright threshold (top 20% of range) - same algorithm as _doUpdateColors
+        const brightThreshold = minB + (maxB - minB) * 0.8;
+
         // Render tokens
         for (const token of sentence.tokens) {
             const span = document.createElement('span');
@@ -375,19 +345,25 @@ export class Renderer {
             // Tool result tokens get distinctive cyan color
             const isToolToken = token.isToolResult || this._isToolMarkerToken(token.text);
             if (isToolToken) {
-                span.style.color = '#4ecdc4';  // Cyan for tool tokens
-                span.style.backgroundColor = 'rgba(78, 205, 196, 0.1)';
+                this._applyToolTokenStyling(span);
                 span.title = `pos:${token.position} b:${token.brightness} [tool]`;
             } else {
-                span.style.color = paragraphColor;  // All tokens same shade
-                span.title = `pos:${token.position} b:${token.brightness}`;
+                const isBright = token.brightness >= brightThreshold;
 
-                // Bright tokens get white text + yellow background
-                if (token.brightness > 255) {
-                    span.style.color = '#ffffff';  // Override paragraph color
-                    const highlightAlpha = Math.min(0.5, (token.brightness - 255) / 1000 * 0.5);
+                if (isBright) {
+                    // Bright tokens (top 20%) get white text + yellow background
+                    span.style.color = '#ffffff';
+                    // Alpha based on position within top 20% (0.2 to 0.5) - same as _doUpdateColors
+                    const topRangeSize = maxB - brightThreshold;
+                    const positionInTopRange = topRangeSize > 0 ? (token.brightness - brightThreshold) / topRangeSize : 1;
+                    const highlightAlpha = 0.2 + positionInTopRange * 0.3;
                     span.style.backgroundColor = `rgba(255, 200, 50, ${highlightAlpha.toFixed(3)})`;
+                } else {
+                    // Normal tokens get paragraph yellow shade
+                    span.style.color = paragraphColor;
+                    span.style.backgroundColor = 'transparent';
                 }
+                span.title = `pos:${token.position} b:${token.brightness}`;
             }
 
             sentenceEl.appendChild(span);
@@ -446,6 +422,15 @@ export class Renderer {
     _isToolMarkerToken(text) {
         // Check for the distinctive markers we use
         return /[⚙️【】→✓❌]/.test(text);
+    }
+
+    /**
+     * Apply tool token styling (cyan color + subtle background)
+     * Used by _doUpdateColors, addToken, and _renderSentence
+     */
+    _applyToolTokenStyling(el) {
+        el.style.color = '#4ecdc4';
+        el.style.backgroundColor = 'rgba(78, 205, 196, 0.1)';
     }
 
     /**

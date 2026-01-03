@@ -371,56 +371,6 @@ class App {
         const skippedBudget = [];
         const positionsToLoad = new Set();  // Positions that need loading from IndexedDB
 
-        // Helper to find conversational pairs from semantic index
-        // Returns: { crossTurnPair, sameTurnS0 }
-        const findPairs = (match) => {
-            const pairs = { crossTurnPair: null, sameTurnS0: null };
-
-            // System chunks don't pair
-            if (match.role === 'system') return pairs;
-
-            // 1. Cross-turn pair (sentence_0 from other role's turn)
-            let pairTurn, pairRole;
-            if (match.role === 'user') {
-                pairTurn = match.turn_id + 1;
-                pairRole = 'assistant';
-            } else if (match.role === 'assistant') {
-                pairTurn = match.turn_id - 1;
-                pairRole = 'user';
-            }
-
-            const crossEntry = this.semanticIndex.entries.find(e =>
-                e.turn_id === pairTurn && e.sentence_id === 0 && e.role === pairRole
-            );
-
-            if (crossEntry) {
-                pairs.crossTurnPair = {
-                    turn_id: pairTurn,
-                    sentence_id: 0,
-                    role: pairRole,
-                    tokenCount: crossEntry.tokenCount
-                };
-            }
-
-            // 2. Same-turn sentence_0 (only if target is NOT sentence_0)
-            if (match.sentence_id !== 0) {
-                const sameTurnEntry = this.semanticIndex.entries.find(e =>
-                    e.turn_id === match.turn_id && e.sentence_id === 0 && e.role === match.role
-                );
-
-                if (sameTurnEntry) {
-                    pairs.sameTurnS0 = {
-                        turn_id: match.turn_id,
-                        sentence_id: 0,
-                        role: match.role,
-                        tokenCount: sameTurnEntry.tokenCount
-                    };
-                }
-            }
-
-            return pairs;
-        };
-
         // First pass: determine what to resurrect and collect positions to load
         for (const match of matches) {
             // Check if chunk is already in memory and alive
@@ -436,7 +386,7 @@ class App {
             }
 
             // Find conversational pairs (cross-turn + same-turn S0)
-            const pairs = findPairs(match);
+            const pairs = this._findResurrectionPairs(match.turn_id, match.sentence_id, match.role);
 
             // Calculate cost for each pair chunk (only if dead)
             let crossTurnCost = 0;
@@ -1338,6 +1288,63 @@ class App {
     }
 
     /**
+     * Find conversational pairs for a chunk (used by both semantic and manual resurrection)
+     * Returns cross-turn pair (S0 from other role) and same-turn S0 (if target isn't S0)
+     *
+     * @param {number} turnId - Target chunk turn ID
+     * @param {number} sentenceId - Target chunk sentence ID
+     * @param {string} role - Target chunk role ('user', 'assistant', 'system')
+     * @returns {Object} { crossTurnPair, sameTurnS0 } - Each is {turn_id, sentence_id, role, tokenCount} or null
+     */
+    _findResurrectionPairs(turnId, sentenceId, role) {
+        const pairs = { crossTurnPair: null, sameTurnS0: null };
+
+        // System chunks don't pair
+        if (role === 'system') return pairs;
+
+        // 1. Cross-turn pair (sentence_0 from other role's turn)
+        let pairTurn, pairRole;
+        if (role === 'user') {
+            pairTurn = turnId + 1;
+            pairRole = 'assistant';
+        } else if (role === 'assistant') {
+            pairTurn = turnId - 1;
+            pairRole = 'user';
+        }
+
+        const crossEntry = this.semanticIndex.entries.find(e =>
+            e.turn_id === pairTurn && e.sentence_id === 0 && e.role === pairRole
+        );
+
+        if (crossEntry) {
+            pairs.crossTurnPair = {
+                turn_id: pairTurn,
+                sentence_id: 0,
+                role: pairRole,
+                tokenCount: crossEntry.tokenCount
+            };
+        }
+
+        // 2. Same-turn sentence_0 (only if target is NOT sentence_0)
+        if (sentenceId !== 0) {
+            const sameTurnEntry = this.semanticIndex.entries.find(e =>
+                e.turn_id === turnId && e.sentence_id === 0 && e.role === role
+            );
+
+            if (sameTurnEntry) {
+                pairs.sameTurnS0 = {
+                    turn_id: turnId,
+                    sentence_id: 0,
+                    role: role,
+                    tokenCount: sameTurnEntry.tokenCount
+                };
+            }
+        }
+
+        return pairs;
+    }
+
+    /**
      * Resurrect a chunk with its turn pairs (same logic as semantic resurrection)
      * @param {number} turn_id - Target chunk turn ID
      * @param {number} sentence_id - Target chunk sentence ID
@@ -1345,54 +1352,7 @@ class App {
      * @returns {Promise<Object>} - Info about resurrected chunks
      */
     async _resurrectChunkWithPairs(turn_id, sentence_id, role) {
-        // Find conversational pairs for this chunk
-        const findPairs = (targetTurn, targetSentence, targetRole) => {
-            const pairs = { crossTurnPair: null, sameTurnS0: null };
-
-            // System chunks don't pair
-            if (targetRole === 'system') return pairs;
-
-            // 1. Cross-turn pair (sentence_0 from other role's turn)
-            let pairTurn, pairRole;
-            if (targetRole === 'user') {
-                pairTurn = targetTurn + 1;
-                pairRole = 'assistant';
-            } else if (targetRole === 'assistant') {
-                pairTurn = targetTurn - 1;
-                pairRole = 'user';
-            }
-
-            const crossEntry = this.semanticIndex.entries.find(e =>
-                e.turn_id === pairTurn && e.sentence_id === 0 && e.role === pairRole
-            );
-
-            if (crossEntry) {
-                pairs.crossTurnPair = {
-                    turn_id: pairTurn,
-                    sentence_id: 0,
-                    role: pairRole
-                };
-            }
-
-            // 2. Same-turn sentence_0 (only if target is NOT sentence_0)
-            if (targetSentence !== 0) {
-                const sameTurnEntry = this.semanticIndex.entries.find(e =>
-                    e.turn_id === targetTurn && e.sentence_id === 0 && e.role === targetRole
-                );
-
-                if (sameTurnEntry) {
-                    pairs.sameTurnS0 = {
-                        turn_id: targetTurn,
-                        sentence_id: 0,
-                        role: targetRole
-                    };
-                }
-            }
-
-            return pairs;
-        };
-
-        const pairs = findPairs(turn_id, sentence_id, role);
+        const pairs = this._findResurrectionPairs(turn_id, sentence_id, role);
         const turnsToLoad = new Set();
 
         // Check if target chunk is in memory
@@ -1763,8 +1723,33 @@ class App {
     }
 
     /**
+     * Find which sentence contains the tool call
+     * Looks for <tool> or </tool> markers in recent tokens of current turn
+     * @param {string} toolCall - The tool call text to find
+     * @returns {number} The sentence_id containing the tool call
+     */
+    _findToolCallSentence(toolCall) {
+        const currentTurnTokens = this.conversation.tokens.filter(
+            t => t.turn_id === this.conversation.currentTurnId && !t.deleted
+        );
+
+        // Search backwards for tool markers (most recent first)
+        for (let i = currentTurnTokens.length - 1; i >= 0; i--) {
+            const tokenText = currentTurnTokens[i].text;
+            if (tokenText.includes('</tool>') || tokenText.includes('<tool>')) {
+                return currentTurnTokens[i].sentence_id;
+            }
+        }
+
+        // Fallback: use current sentence (shouldn't happen normally)
+        console.warn('Could not find tool call sentence, using current');
+        return this.conversation.currentSentenceId;
+    }
+
+    /**
      * Add tool result as proper conversation tokens
      * Uses text markers that survive tokenization: ⚙️【command】→ result
+     * Tool results are added to the SAME sentence as their tool call
      */
     async _addToolResultAsTokens(toolCall, result) {
         // Extract the command from <tool>...</tool>
@@ -1783,36 +1768,26 @@ class App {
         // Tokenize the result
         const tokens = await this.client.tokenize(combinedText);
 
-        // Decrement sentence_id to merge tool result into same chunk as tool call
-        // This counters any boundary detection that happened at end of </tool>
-        if (this.conversation.currentSentenceId > 0) {
-            this.conversation.currentSentenceId--;
-        }
+        // Find which sentence contains the tool call (don't decrement - look it up!)
+        const toolCallSentenceId = this._findToolCallSentence(toolCall);
 
-        // Add tokens to the conversation
+        // Add tokens to the conversation with explicit sentence assignment
         for (const t of tokens) {
-            const token = this.conversation.addStreamingToken(t.token_id, t.text);
-
-            // Set proper metadata
-            token.role = 'assistant';
-            token.turn_id = this.conversation.currentTurnId;  // We're still on the assistant turn
-
-            // Mark as tool result for special rendering
-            token.isToolResult = true;
+            // Use new options API: override sentence_id, skip boundary detection, mark as tool result
+            const token = this.conversation.addStreamingToken(t.token_id, t.text, {
+                sentenceIdOverride: toolCallSentenceId,
+                skipBoundaryDetection: true,
+                isToolResult: true
+            });
 
             // Render the token
             this.renderer.addToken(token, this.conversation);
-
-            // Persist to database (fire-and-forget)
-            this.store.saveToken(token).catch(err => {
-                console.warn('Failed to persist tool result token:', err);
-            });
         }
 
         // Update stats
         this._updateStats();
 
-        console.log(`🔧 Added tool result as ${tokens.length} tokens in conversation`);
+        console.log(`🔧 Added tool result as ${tokens.length} tokens to sentence ${toolCallSentenceId}`);
     }
 
     /**

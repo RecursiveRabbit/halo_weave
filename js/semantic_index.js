@@ -620,10 +620,17 @@ export class SemanticIndex {
         // Build text from tokens
         const text = sentence.tokens.map(t => t.text).join('');
         const tokenCount = sentence.tokens.length;
-        
+
         // Build context window
         const contextText = this._buildContextWindow(sentence, sentences, conversation);
-        
+
+        // Calculate brightness to preserve (same logic as indexNewChunks)
+        // Use peakBrightnessAtDeletion if available (pruned chunk),
+        // otherwise use current peakBrightness (active chunk, default to 10k if never seen attention)
+        const brightness = sentence.peakBrightnessAtDeletion !== null
+            ? sentence.peakBrightnessAtDeletion
+            : (sentence.peakBrightness === -Infinity ? 10000 : sentence.peakBrightness);
+
         // Create new entry
         const entry = {
             turn_id,
@@ -631,6 +638,7 @@ export class SemanticIndex {
             role,
             text,
             tokenCount,
+            brightness_at_deletion: brightness,  // Preserve brightness for resurrection
             embedding: null,
             referenceCount: 0,
             indexedAt: Date.now()

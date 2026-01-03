@@ -395,16 +395,12 @@ export class PersistentStore {
                 }));
 
                 // Move to deadTokens
-                let completed = 0;
-                const total = tokens.length;
-
                 for (const token of deadTokens) {
                     deadStore.put(token);
                     liveStore.delete(token.position);
-                    completed++;
                 }
 
-                tx.oncomplete = () => resolve(total);
+                tx.oncomplete = () => resolve(tokens.length);
                 tx.onerror = () => reject(tx.error);
             };
 
@@ -448,16 +444,12 @@ export class PersistentStore {
                 }));
 
                 // Move to liveTokens
-                let completed = 0;
-                const total = tokens.length;
-
                 for (const token of liveTokens) {
                     liveStore.put(token);
                     deadStore.delete(token.position);
-                    completed++;
                 }
 
-                tx.oncomplete = () => resolve(total);
+                tx.oncomplete = () => resolve(tokens.length);
                 tx.onerror = () => reject(tx.error);
             };
 

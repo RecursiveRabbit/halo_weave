@@ -209,10 +209,15 @@ export class Conversation {
      * Fire-and-forget persistence for speed (DB writes async in background)
      * @param {number} tokenId - Token ID
      * @param {string} text - Token text
+     * @param {Object} options - Optional settings
+     * @param {number} options.sentenceIdOverride - Force specific sentence_id (for tool results)
+     * @param {boolean} options.skipBoundaryDetection - Skip boundary detection (for metadata tokens)
+     * @param {boolean} options.isToolResult - Mark token as tool result
      * @returns {Object} The created token (synchronously for rendering)
      */
-    addStreamingToken(tokenId, text) {
-        const sentenceId = this.currentSentenceId;
+    addStreamingToken(tokenId, text, options = {}) {
+        // Use override if provided, otherwise current sentence
+        const sentenceId = options.sentenceIdOverride ?? this.currentSentenceId;
 
         const token = {
             token_id: tokenId,
@@ -223,7 +228,8 @@ export class Conversation {
             role: this.currentRole,
             sentence_id: sentenceId,
             deleted: false,
-            pinned: false
+            pinned: false,
+            isToolResult: options.isToolResult || false
         };
 
         this.tokens.push(token);
@@ -241,8 +247,10 @@ export class Conversation {
             this._activeTokenCount++;
         }
 
-        // Detect sentence boundaries
-        this._updateSentenceBoundary(text);
+        // Detect sentence boundaries (skip for metadata tokens like tool results)
+        if (!options.skipBoundaryDetection) {
+            this._updateSentenceBoundary(text);
+        }
 
         return token;
     }
