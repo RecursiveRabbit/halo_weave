@@ -273,12 +273,31 @@ class App {
                 iteration++;
                 console.log(`🔄 Tool iteration ${iteration}: continuing generation after tool execution...`);
 
-                // Continue generation from current context (no new prefix, same assistant turn)
+                // Add ChatML continuation (no timestamp header) so model knows it's still assistant
+                const aiName = this.elements.aiName.value.trim() || 'assistant';
+                const continuationTokens = await this.client.tokenize(`<|im_end|>\n<|im_start|>${aiName}\n`);
+                for (const t of continuationTokens) {
+                    const token = this.conversation.addStreamingToken(t.token_id, t.text);
+                    this.renderer.addToken(token, this.conversation);
+                }
+
+                // Continue generation from current context
                 await this._continueGeneration();
             }
 
             if (iteration >= MAX_TOOL_ITERATIONS) {
                 console.warn(`⚠️ Tool iteration limit (${MAX_TOOL_ITERATIONS}) reached`);
+            }
+
+            // Add <|im_end|> to close assistant turn (only once, after all tool iterations)
+            try {
+                const endTokens = await this.client.tokenize('<|im_end|>\n');
+                for (const t of endTokens) {
+                    const token = this.conversation.addStreamingToken(t.token_id, t.text);
+                    this.renderer.addToken(token, this.conversation);
+                }
+            } catch (err) {
+                console.warn('Failed to add im_end token:', err);
             }
 
             // End assistant turn
@@ -797,18 +816,8 @@ class App {
         
         console.log('🔓 Generation Promise resolved');
 
-        // Add end token to close assistant turn
-        try {
-            const endTokens = await this.client.tokenize('<|im_end|>\n');
-            for (const t of endTokens) {
-                const token = this.conversation.addStreamingToken(t.token_id, t.text);
-                this.renderer.addToken(token, this.conversation);
-            }
-        } catch (err) {
-            console.warn('Failed to add end token:', err);
-        }
-
-        // Tool processing moved to _handleSend loop for continuation support
+        // NOTE: <|im_end|> is NOT added here - it's added after all tool iterations
+        // complete in _handleSend(), so the model can continue seamlessly after tool calls
 
         this._updateStats();
         console.log('🔓 _generate() complete');
@@ -986,17 +995,33 @@ class App {
         try {
             await this.store.clearAll();
             console.log('💾 Database cleared');
-            this._setStatus('Database cleared', 'success');
+
+            // Reset notes to fresh state
+            await this.store.saveToolData('notes.json', {
+                _metadata: {
+                    created: new Date().toISOString(),
+                    last_modified: new Date().toISOString(),
+                    description: "AI assistant's persistent notes and memory"
+                },
+                topics: {},
+                reminders: [],
+                context: {},
+                scratch: {}
+            });
+            console.log('📝 Notes reset');
+
+            this._setStatus('Database and notes cleared', 'success');
         } catch (err) {
             console.error('Failed to clear database:', err);
             this._setStatus('Failed to clear database', 'error');
         }
     }
 
-    _handleExport() {
+    async _handleExport() {
         const state = {
             conversation: this.conversation.exportState(),
-            semanticIndex: this.semanticIndex.exportState()  // Exclude embeddings to keep file size manageable
+            semanticIndex: this.semanticIndex.exportState(),  // Exclude embeddings to keep file size manageable
+            notes: await this.toolSystem.getNotesContent()    // Include AI's notes
         };
         const json = JSON.stringify(state, null, 2);
         
@@ -1047,7 +1072,13 @@ class App {
                     this.semanticIndex.clear();
                     await this.semanticIndex.indexNewChunks(this.conversation);
                 }
-                
+
+                // Restore notes if present (use store directly to preserve metadata)
+                if (data.notes) {
+                    await this.store.saveToolData('notes.json', data.notes);
+                    console.log('📝 Restored notes from export');
+                }
+
                 // Rebuild UI
                 this.renderer.rebuild(this.conversation);
                 this._updateStats();
@@ -1752,8 +1783,11 @@ class App {
         // Tokenize the result
         const tokens = await this.client.tokenize(combinedText);
 
-        // DON'T increment sentence_id - tool result stays in same chunk as tool call
-        // This ensures <tool>...</tool> and ⚙️【】→ result are indexed together
+        // Decrement sentence_id to merge tool result into same chunk as tool call
+        // This counters any boundary detection that happened at end of </tool>
+        if (this.conversation.currentSentenceId > 0) {
+            this.conversation.currentSentenceId--;
+        }
 
         // Add tokens to the conversation
         for (const t of tokens) {

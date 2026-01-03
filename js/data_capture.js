@@ -22,6 +22,7 @@ export class DataCapture {
         this.captureTimestamp = null;
         this.captureDir = null;
         this.tokenCount = 0;
+        this.nextFileIndex = 0;  // Own counter - never resets during capture session
         this._writeQueue = [];
         this._isProcessingQueue = false;
     }
@@ -56,6 +57,7 @@ export class DataCapture {
     async startCapture(metadata = {}) {
         this.captureTimestamp = Date.now();
         this.tokenCount = 0;
+        this.nextFileIndex = 0;
 
         console.log('🎬 Starting data capture...');
 
@@ -139,16 +141,20 @@ export class DataCapture {
      * Queues writes to prevent overwhelming the server
      * @param {Object} token - Token object
      * @param {Object} attention - Full attention tensor from KoboldCPP
-     * @param {number} generationStep - Which token in generation (0-indexed)
+     * @param {number} generationStep - Which token in this generation (for metadata)
      */
     async recordGeneratedToken(token, attention, generationStep) {
         if (!this.isCapturing) return;
 
+        // Use our own file index (never resets during capture session)
+        const fileIndex = this.nextFileIndex++;
+
         // Queue the write job (don't block)
         this._writeQueue.push({
-            generationStep,
+            fileIndex,  // Used for file naming - unique across entire capture
             tokenMeta: {
-                step: generationStep,
+                file_index: fileIndex,
+                generation_step: generationStep,  // Token's position within its generation
                 token_id: token.token_id,
                 text: token.text,
                 position: token.position,
@@ -156,7 +162,7 @@ export class DataCapture {
                 attention_shape: attention ? attention.shape : null,
                 attention_context_length: attention ? attention.contextLength : null
             },
-            attentionBuffer: attention?.data?.buffer ? 
+            attentionBuffer: attention?.data?.buffer ?
                 attention.data.buffer.slice(0) : null  // Copy buffer before it gets reused
         });
 
@@ -183,12 +189,12 @@ export class DataCapture {
      * Actually write a token to disk
      */
     async _writeToken(job) {
-        const { generationStep, tokenMeta, attentionBuffer } = job;
+        const { fileIndex, tokenMeta, attentionBuffer } = job;
 
         try {
             // Write metadata JSON (tiny, fast)
             const metaResponse = await fetch(
-                `${CAPTURE_SERVER}/capture?action=write_token_meta&ts=${this.captureTimestamp}&index=${generationStep}`,
+                `${CAPTURE_SERVER}/capture?action=write_token_meta&ts=${this.captureTimestamp}&index=${fileIndex}`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -197,13 +203,13 @@ export class DataCapture {
             );
 
             if (!metaResponse.ok) {
-                console.warn(`⚠️  Failed to write token meta ${generationStep}: ${metaResponse.statusText}`);
+                console.warn(`⚠️  Failed to write token meta ${fileIndex}: ${metaResponse.statusText}`);
             }
 
             // Write attention binary
             if (attentionBuffer) {
                 const binResponse = await fetch(
-                    `${CAPTURE_SERVER}/capture?action=write_token_attn&ts=${this.captureTimestamp}&index=${generationStep}`,
+                    `${CAPTURE_SERVER}/capture?action=write_token_attn&ts=${this.captureTimestamp}&index=${fileIndex}`,
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/octet-stream' },
@@ -212,14 +218,14 @@ export class DataCapture {
                 );
 
                 if (!binResponse.ok) {
-                    console.warn(`⚠️  Failed to write attention ${generationStep}: ${binResponse.statusText}`);
+                    console.warn(`⚠️  Failed to write attention ${fileIndex}: ${binResponse.statusText}`);
                 }
             }
 
             this.tokenCount++;
 
         } catch (err) {
-            console.warn(`⚠️  Error writing token ${generationStep}:`, err);
+            console.warn(`⚠️  Error writing token ${fileIndex}:`, err);
         }
     }
 

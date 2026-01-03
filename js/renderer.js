@@ -140,18 +140,14 @@ export class Renderer {
                     continue;
                 }
 
-                const lastB = this.lastBrightness.get(token.position);
                 const currentB = token.brightness;
 
                 // Calculate brightness threshold for "bright" tokens (top 20% of range)
                 const brightThreshold = minB + (maxB - minB) * 0.8;
                 const isBright = currentB >= brightThreshold;
-                const wasBright = lastB !== undefined && lastB >= brightThreshold;
 
-                // Skip if this token's brightness hasn't changed
-                // AND the paragraph peak hasn't changed (which affects non-bright tokens)
-                if (lastB === currentB && !peakChanged) continue;
-                if (!isBright && !wasBright && !peakChanged) continue;
+                // No skip optimization - always update colors
+                // (Optimization was skipping updates when global min/max range changed)
 
                 this.lastBrightness.set(token.position, currentB);
 

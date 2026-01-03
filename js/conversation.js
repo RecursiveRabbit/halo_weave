@@ -5,14 +5,15 @@
  *
  * Algorithm (per generation step):
  * 1. Aggregate attention across layers/heads
- * 2. Calculate threshold excluding BOS: (1.0 - bos_attention) / (context_len - 1)
- * 3. Calculate mean brightness across all active tokens
- * 4. For each non-BOS token (including current turn):
+ * 2. Find attention sink dynamically (max attention token - varies by model)
+ * 3. Calculate threshold excluding sink: (1.0 - sink_attention) / (context_len - 1)
+ * 4. Calculate mean brightness across all active tokens
+ * 5. For each token:
  *    - If attention > threshold: score += int(attention / threshold), cap at 10000
  *    - If attention <= threshold: score -= 1
- * 5. New tokens start at 10000 (fail-bright)
- * 6. Resurrected tokens start at mean brightness (unproven but relevant)
- * 7. No floor - scores can go negative
+ * 6. New tokens start at 10000 (fail-bright)
+ * 7. Resurrected tokens start at mean brightness (unproven but relevant)
+ * 8. No floor - scores can go negative
  *
  * Pruning: while (activeTokenCount > budget) { delete lowest peak brightness sentence }
  */
@@ -471,10 +472,17 @@ export class Conversation {
         // Total context includes system prompt
         const totalLen = sysLen + convLen;
 
-        // O(1) threshold calculation excluding BOS (at index 0, which is in system prompt)
-        // BOS is always at aggregated[0], part of system prompt
-        const bosAttention = aggregated[0];
-        const threshold = (1.0 - bosAttention) / (totalLen - 1);
+        // Find attention sink dynamically (highest attention token)
+        // Different models use different tokens as sinks - can't assume index 0
+        let sinkAttention = 0;
+        for (let i = 0; i < aggregated.length; i++) {
+            if (aggregated[i] > sinkAttention) {
+                sinkAttention = aggregated[i];
+            }
+        }
+
+        // Threshold = average attention excluding the sink
+        const threshold = (1.0 - sinkAttention) / (totalLen - 1);
 
         // Skip if threshold is invalid
         if (threshold <= 0 || !isFinite(threshold)) return;

@@ -130,7 +130,13 @@ export class KoboldClient {
                     rep_pen: config.repetitionPenalty || 1.0,
                     output_attentions: config.returnAttention !== false,
                     request_id: requestId,
-                    sampler_seed: config.seed || -1
+                    sampler_seed: config.seed || -1,
+                    // Stop sequences to prevent model from generating user turns or fake tool results
+                    stop_sequence: config.stopSequences || [
+                        '<|im_start|>user', '<|im_start|>system',  // ChatML format
+                        ')  user\n', ')  system\n',                 // Display format (double space after timestamp)
+                        '</tool>'                                   // Stop after tool tag, let system execute
+                    ]
                 })
             });
 
